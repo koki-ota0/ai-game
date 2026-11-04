@@ -1,5 +1,5 @@
 import { SoundSystem } from './audio';
-import { CORES } from './types';
+import { BASTION_COLOR, CORES, ECHO_COLOR } from './types';
 import { UPGRADES, UPGRADE_BY_ID } from './upgrades';
 import { LEVELS, LEVEL_STARTING_MODIFIER, formatStage } from './levels';
 import type { LevelDefinition } from './levels';
@@ -164,6 +164,8 @@ export class GameEngine {
   private status: EngineStatus = 'idle';
   private checkpointNewBest = false;
   private checkpointScore = -1;
+  private reviveUsed = false;
+  private runCounted = false;
   private core: CoreId = 'wraith';
   private difficulty: Difficulty = 'standard';
   private gameMode: GameMode = 'infinite';
@@ -333,6 +335,7 @@ export class GameEngine {
     this.echoesCreated = 0; this.rerolls = 1; this.nextId = 1; this.seenKinds.clear(); this.bossId = null;
     this.pendingBossDraft = false; this.shotCounter = 0; this.historyTimer = 0;
     this.checkpointNewBest = false; this.checkpointScore = -1;
+    this.reviveUsed = false; this.runCounted = false;
     this.shake = 0; this.flash = 0; this.slowMotion = 0; this.keys.clear();
     this.pointer = { x: W / 2, y: H / 2, down: false, inside: false, manualShots: 0 };
     this.firePointerId = null; this.pointerButtons = 0; this.touchMove = { x: 0, y: 0 };
@@ -384,6 +387,35 @@ export class GameEngine {
     this.gameOver(true);
   }
 
+  reviveInfinite(): boolean {
+    if (this.status !== 'gameover' || this.challenge || this.reviveUsed || this.player.hp > 0) return false;
+    this.reviveUsed = true;
+    const p = this.player;
+    p.hp = Math.max(1, p.stats.maxHp * 0.5);
+    p.invulnerable = 3;
+    p.vx = 0; p.vy = 0; p.dashTimer = 0; p.dashCooldown = 0;
+    this.projectiles = this.projectiles.filter(projectile => projectile.friendly);
+    for (const enemy of this.enemies) {
+      if (enemy.dead) continue;
+      const d = distance(p.x, p.y, enemy.x, enemy.y);
+      if (d >= 260) continue;
+      const angle = Math.atan2(enemy.y - p.y, enemy.x - p.x);
+      const force = enemy.kind === 'boss' ? 110 : 420;
+      enemy.vx += Math.cos(angle) * force;
+      enemy.vy += Math.sin(angle) * force;
+    }
+    this.keys.clear(); this.touchMove = { x: 0, y: 0 };
+    this.pointer.down = false; this.firePointerId = null; this.pointerButtons = 0;
+    this.shockwaves.push({ x: p.x, y: p.y, life: 0.75, maxLife: 0.75, radius: 250, color: ECHO_COLOR });
+    for (let i = 0; i < 36; i++) this.particle(p.x, p.y, ECHO_COLOR, 1, 260, 0.65, 6);
+    this.flash = 0.55; this.shake = 8;
+    this.setStatus('running');
+    this.sound.play('level');
+    this.toast('SIGNAL RESTORED // 1 OF 1', '時間へ復帰', 'HP 50% / 3秒無敵 / このランの復活権を消費', 'cyan');
+    this.emitHud();
+    return true;
+  }
+
   setTouchMove(x: number, y: number) { this.touchMove = { x, y }; }
 
   triggerDash() { if (this.status === 'running') this.dash(); }
@@ -425,7 +457,7 @@ export class GameEngine {
       projectiles: this.projectiles.length, echoes: this.echoes.length,
       sector: this.sector, level: this.level, score: this.score, seed: this.seed,
       weaponCooldown: this.player?.weaponCooldown, manualShots: this.pointer.manualShots, tutorialStep: this.tutorialStep,
-      gameMode: this.gameMode, challengeLevel: this.challenge?.id ?? 0,
+      gameMode: this.gameMode, challengeLevel: this.challenge?.id ?? 0, reviveUsed: this.reviveUsed,
       initialBonusRanks: this.initialBonusRanks, initialBonuses: { ...this.activeBonuses },
       bossDefeated: this.bossDefeated, remainingEnemies: this.enemies.filter(enemy => !enemy.dead).length,
       rift: this.rift ? { x: this.rift.x, y: this.rift.y, progress: this.rift.progress, life: this.rift.life } : null,
@@ -690,7 +722,7 @@ export class GameEngine {
         echo.x = frame.x; echo.y = frame.y; echo.angle = frame.angle;
         for (const shot of frame.shots) this.fireRecordedShot(echo, shot, frame.angle);
         echo.index++;
-        if (Math.random() < 0.3) this.particle(echo.x, echo.y, '#69d9ff', 1, 35, 0.25, 5);
+        if (Math.random() < 0.3) this.particle(echo.x, echo.y, ECHO_COLOR, 1, 35, 0.25, 5);
       }
       if (echo.life <= 0 || echo.index >= echo.frames.length) this.expireEcho(echoIndex);
     }
@@ -1181,7 +1213,7 @@ export class GameEngine {
       this.flash = Math.max(this.flash, 0.22);
     } else {
       const radius = 310;
-      this.shockwaves.push({ x: p.x, y: p.y, life: 0.48, maxLife: 0.48, radius, color: '#ffbd69' });
+      this.shockwaves.push({ x: p.x, y: p.y, life: 0.48, maxLife: 0.48, radius, color: BASTION_COLOR });
       for (const enemy of this.enemies) {
         if (enemy.dead) continue;
         const d = distance(p.x, p.y, enemy.x, enemy.y);
@@ -1195,7 +1227,7 @@ export class GameEngine {
       for (const projectile of this.projectiles) {
         if (!projectile.friendly && distance(p.x, p.y, projectile.x, projectile.y) < radius) projectile.life = 0;
       }
-      for (let i = 0; i < 36; i++) this.particle(p.x, p.y, '#ffbd69', 1, 300, 0.55, 7);
+      for (let i = 0; i < 36; i++) this.particle(p.x, p.y, BASTION_COLOR, 1, 300, 0.55, 7);
       this.sound.play('nova', 1.3);
       this.shake = Math.max(this.shake, 12);
     }
@@ -1257,7 +1289,7 @@ export class GameEngine {
     const p = this.player;
     const speed = p.stats.projectileSpeed * (kind === 'nova' ? 0.76 : 1);
     const life = (kind === 'nova' ? 0.82 : 1.2) * Math.pow(p.stats.projectileSpeed / 610, 0.55);
-    const color = source === 'echo' ? '#69d9ff' : this.core === 'bastion' ? '#ffbd69' : '#62f6e7';
+    const color = source === 'echo' ? ECHO_COLOR : this.core === 'bastion' ? BASTION_COLOR : '#62f6e7';
     this.projectiles.push({
       id: this.nextId++, x: x + Math.cos(angle) * 23, y: y + Math.sin(angle) * 23,
       vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed, radius: kind === 'nova' ? 5 : 4,
@@ -1299,7 +1331,7 @@ export class GameEngine {
     if (points.length === 2 && chains > 1 && !primary.dead) {
       this.damageEnemy(primary, damage * (chains - 1) * 0.22, source);
     }
-    this.beams.push({ points, life: 0.16, maxLife: 0.16, color: source === 'echo' ? '#69d9ff' : '#aa96ff' });
+    this.beams.push({ points, life: 0.16, maxLife: 0.16, color: source === 'echo' ? ECHO_COLOR : '#aa96ff' });
   }
 
   private enemyShot(x: number, y: number, angle: number, speed: number, damage: number, radius: number) {
@@ -1447,7 +1479,7 @@ export class GameEngine {
     this.echoesCreated++;
     this.sound.play('echo');
     this.shake = Math.max(this.shake, 4);
-    for (let i = 0; i < 22; i++) this.particle(frames[0].x, frames[0].y, '#69d9ff', 1, 160, 0.55, 5);
+    for (let i = 0; i < 22; i++) this.particle(frames[0].x, frames[0].y, ECHO_COLOR, 1, 160, 0.55, 5);
     if (!dash && this.echoesCreated === 1) this.toast('ECHO SYNCHRONIZED', '過去の自分が参戦', '同じ敵を挟み撃ちにして共鳴せよ', 'cyan');
   }
 
@@ -1462,7 +1494,7 @@ export class GameEngine {
           this.damageEnemy(enemy, this.player.stats.damage * (1.8 + afterimage * 0.9) * this.player.stats.echoDamage, 'echo');
         }
       }
-      for (let i = 0; i < 30; i++) this.particle(echo.x, echo.y, '#69d9ff', 1, 260, 0.65, 6);
+      for (let i = 0; i < 30; i++) this.particle(echo.x, echo.y, ECHO_COLOR, 1, 260, 0.65, 6);
       this.shake = Math.max(this.shake, 8);
     }
     this.echoes.splice(index, 1);
@@ -1580,14 +1612,18 @@ export class GameEngine {
       const next = Math.min(LEVELS.length, this.challenge.id + 1);
       if (next > unlocked) localStorage.setItem('echo-abyss-unlocked-level', String(next));
     }
-    const runs = Number(localStorage.getItem('echo-abyss-runs') ?? 0);
-    localStorage.setItem('echo-abyss-runs', String(runs + 1));
+    if (!this.runCounted) {
+      const runs = Number(localStorage.getItem('echo-abyss-runs') ?? 0);
+      localStorage.setItem('echo-abyss-runs', String(runs + 1));
+      this.runCounted = true;
+    }
     this.callbacks.onGameOver({
       score: finalScore, sector: this.sector, elapsed: this.elapsed, kills: this.kills,
       level: this.level, echoes: this.echoesCreated, bestCombo: this.bestCombo,
       core: this.core, seed: this.seed, difficulty: this.difficulty,
       gameMode: this.gameMode, challengeLevel: this.challenge?.id ?? 0, victory, newBest,
       xpEarned, totalXp, bonusPoints: getBonusPoints(totalXp), firstClear,
+      reviveAvailable: !victory && !this.challenge && !this.reviveUsed,
     });
   }
 
@@ -1973,11 +2009,11 @@ export class GameEngine {
 
   private drawEchoes(ctx: CanvasRenderingContext2D, time: number) {
     for (const echo of this.echoes) {
-      ctx.strokeStyle = `rgba(105,217,255,${echo.alpha * 0.18})`;
+      ctx.strokeStyle = `rgba(79,141,255,${echo.alpha * 0.18})`;
       ctx.lineWidth = 1; ctx.setLineDash([5, 10]);
       ctx.beginPath(); ctx.moveTo(this.player.x, this.player.y); ctx.lineTo(echo.x, echo.y); ctx.stroke(); ctx.setLineDash([]);
-      this.drawShip(ctx, echo.x, echo.y, echo.angle, '#69d9ff', echo.alpha, this.player.radius);
-      ctx.strokeStyle = `rgba(105,217,255,${echo.alpha * 0.45})`;
+      this.drawShip(ctx, echo.x, echo.y, echo.angle, ECHO_COLOR, echo.alpha, this.player.radius);
+      ctx.strokeStyle = `rgba(79,141,255,${echo.alpha * 0.45})`;
       ctx.beginPath(); ctx.arc(echo.x, echo.y, 26 + Math.sin(time * 5) * 3, 0, TAU); ctx.stroke();
     }
   }
@@ -1994,7 +2030,7 @@ export class GameEngine {
       ctx.strokeStyle = 'rgba(156,140,255,.75)'; ctx.lineWidth = 2; ctx.setLineDash([8, 7]);
       ctx.beginPath(); ctx.arc(p.x, p.y, 30 + Math.sin(time * 3) * 2, time, time + TAU); ctx.stroke(); ctx.setLineDash([]);
     }
-    const color = this.core === 'tempest' ? '#aa96ff' : this.core === 'bastion' ? '#ffbd69' : '#62f6e7';
+    const color = this.core === 'tempest' ? '#aa96ff' : this.core === 'bastion' ? BASTION_COLOR : '#62f6e7';
     this.drawShip(ctx, p.x, p.y, p.angle, color, blink ? 0.38 : 1, p.radius * 1.12);
     if (this.tutorialEnabled && this.tutorialStep === 0) {
       const pulse = 2 + Math.sin(time * 4) * 2;
@@ -2025,7 +2061,7 @@ export class GameEngine {
 
   private drawCursor(ctx: CanvasRenderingContext2D, time: number) {
     if (!this.pointer.inside || this.status !== 'running') return;
-    const color = this.core === 'tempest' ? '#aa96ff' : this.core === 'bastion' ? '#ffbd69' : '#62f6e7';
+    const color = this.core === 'tempest' ? '#aa96ff' : this.core === 'bastion' ? BASTION_COLOR : '#62f6e7';
     ctx.save();
     if (this.pointer.down) {
       ctx.strokeStyle = color; ctx.globalAlpha = 0.16; ctx.setLineDash([3, 10]);

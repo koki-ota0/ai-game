@@ -156,6 +156,12 @@ function App() {
     void engineRef.current?.start(core, runDifficulty, runSeed, runMode, challenge, runMode === 'level' ? bonusLoadout : undefined);
   };
 
+  const revive = () => {
+    if (!engineRef.current?.reviveInfinite()) return;
+    setResult(null);
+    setDraft(null);
+  };
+
   const exitToMenu = () => {
     engineRef.current?.pause();
     setPhase('menu');
@@ -549,6 +555,12 @@ function App() {
               <div><Copy size={17} /><small>ECHOES</small><strong>{result.echoes}</strong></div>
               <div><GitBranch size={17} /><small>BEST SYNC</small><strong>{result.bestCombo}×</strong></div>
             </div>
+            {result.reviveAvailable && (
+              <div className="revive-offer">
+                <div className="revive-copy"><small>AD REVIVE // 1 RUN 1 USE</small><p>現在は広告なしで即復活。HP 50%・3秒無敵で、同じセクターの戦闘へ戻ります。</p></div>
+                <button className="revive-button" onClick={revive}><Play size={17} fill="currentColor" /> 広告を見て復活 <span>FREE</span></button>
+              </div>
+            )}
             <div className="result-actions">
               {result.victory && result.gameMode === 'level' && result.challengeLevel < LEVELS.length ? (
                 <>

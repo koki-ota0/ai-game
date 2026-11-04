@@ -380,6 +380,13 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .result-stats svg { color: #597570; margin-bottom: 3px; }
 .result-stats small { color: #58716d; font-size: 7px; letter-spacing: .1em; }
 .result-stats strong { font-size: 17px; font-weight: 500; }
+.revive-offer { margin-top: 16px; padding: 12px 14px; text-align: left; background: rgba(79,141,255,.065); border: 1px solid rgba(79,141,255,.28); }
+.revive-copy small { color: #8fb5ff; font-size: 8px; letter-spacing: .16em; }
+.revive-copy p { margin: 5px 0 10px; color: #93a9bb; font-size: 9px; line-height: 1.6; }
+.revive-button { display: flex; align-items: center; justify-content: center; gap: 9px; width: 100%; min-height: 44px; padding: 10px 14px; color: #071426; background: #4f8dff; font-size: 11px; font-weight: 600; transition: filter .2s, box-shadow .2s; }
+.revive-button:hover { filter: brightness(1.12); box-shadow: 0 0 24px rgba(79,141,255,.18); }
+.revive-button span { margin-left: auto; padding: 2px 5px; color: #dce9ff; background: rgba(7,20,38,.55); font-size: 7px; letter-spacing: .12em; }
+.revive-offer + .result-actions { margin-top: 10px; }
 .result-actions { display: grid; grid-template-columns: 1.15fr 1fr; gap: 8px; margin-top: 20px; }
 .result-actions .secondary-button { margin: 0; }
 .result-actions .primary-button span { margin-left: auto; font-size: 7px; opacity: .5; }

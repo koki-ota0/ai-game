@@ -1,5 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { SoundSystem } from '../src/game/audio';
+import { BASTION_COLOR, CORES, ECHO_COLOR } from '../src/game/types';
 
 const snapshot = async (page: import('@playwright/test').Page) =>
   page.evaluate(() => (window as any).__ECHO__.getDebugSnapshot());
@@ -83,7 +84,7 @@ test('movement, echo, pause, draft, reroll, death, and same-seed retry form a co
 
   await page.evaluate(() => {
     const engine = (window as any).__ECHO__;
-    engine.player.invulnerable = 0;
+    engine.player.invulnerable = 0; engine.player.shieldReady = false;
     engine.hurtPlayer(99999);
   });
   await expect(page.getByText('SIGNAL', { exact: false })).toBeVisible();
@@ -92,6 +93,70 @@ test('movement, echo, pause, draft, reroll, death, and same-seed retry form a co
   await expect.poll(async () => (await snapshot(page)).status).toBe('running');
   expect((await snapshot(page)).seed).toBe(seed);
   expect(errors).toEqual([]);
+});
+
+test('INFINITE offers one free ad revive per run and LEVEL offers none', async ({ page }) => {
+  await page.evaluate(async () => {
+    const engine = (window as any).__ECHO__;
+    await engine.start('wraith', 'standard', 'REVIVE-ONCE', 'infinite');
+    engine.score = 4000; engine.level = 3; engine.player.level = 3;
+    engine.enemyShot(engine.player.x + 100, engine.player.y, 0, 100, 10, 6);
+    engine.player.invulnerable = 0; engine.player.shieldReady = false;
+    engine.hurtPlayer(99999);
+  });
+  await expect(page.getByRole('heading', { name: 'SIGNAL LOST' })).toBeVisible();
+  await expect(page.getByRole('button', { name: /広告を見て復活/ })).toBeVisible();
+  await expect(page.locator('.revive-offer')).toContainText('現在は広告なしで即復活');
+  expect(await page.evaluate(() => localStorage.getItem('echo-abyss-runs'))).toBe('1');
+
+  await page.getByRole('button', { name: /広告を見て復活/ }).click();
+  await expect.poll(async () => (await snapshot(page)).status).toBe('running');
+  await expect(page.locator('.result-panel')).toHaveCount(0);
+  const revived = await page.evaluate(() => {
+    const engine = (window as any).__ECHO__;
+    return {
+      hp: engine.player.hp, maxHp: engine.player.stats.maxHp, invulnerable: engine.player.invulnerable,
+      enemyProjectiles: engine.projectiles.filter((projectile: any) => !projectile.friendly).length,
+      score: engine.score, level: engine.level, reviveUsed: engine.reviveUsed,
+    };
+  });
+  expect(revived.hp).toBeCloseTo(revived.maxHp * 0.5, 5);
+  expect(revived.invulnerable).toBeGreaterThan(0);
+  expect(revived.invulnerable).toBeLessThanOrEqual(3);
+  expect(revived.enemyProjectiles).toBe(0);
+  expect(revived.score).toBeGreaterThanOrEqual(4000);
+  expect(revived.level).toBe(3);
+  expect(revived.reviveUsed).toBe(true);
+
+  await page.evaluate(() => {
+    const engine = (window as any).__ECHO__;
+    engine.player.invulnerable = 0; engine.player.shieldReady = false;
+    engine.hurtPlayer(99999);
+  });
+  await expect(page.getByRole('heading', { name: 'SIGNAL LOST' })).toBeVisible();
+  await expect(page.getByRole('button', { name: /広告を見て復活/ })).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).__ECHO__.reviveInfinite())).toBe(false);
+  expect(await page.evaluate(() => localStorage.getItem('echo-abyss-runs'))).toBe('1');
+
+  await page.getByRole('button', { name: /同じ時間へ戻る/ }).click();
+  await expect.poll(async () => (await snapshot(page)).status).toBe('running');
+  expect((await snapshot(page)).reviveUsed).toBe(false);
+  await page.evaluate(() => {
+    const engine = (window as any).__ECHO__;
+    engine.player.invulnerable = 0; engine.player.shieldReady = false;
+    engine.hurtPlayer(99999);
+  });
+  await expect(page.getByRole('button', { name: /広告を見て復活/ })).toBeVisible();
+
+  await page.evaluate(async () => {
+    const engine = (window as any).__ECHO__;
+    await engine.start('wraith', 'standard', 'REVIVE-LEVEL', 'level', 1);
+    engine.player.invulnerable = 0; engine.player.shieldReady = false;
+    engine.hurtPlayer(99999);
+  });
+  await expect(page.getByRole('heading', { name: 'SIGNAL LOST' })).toBeVisible();
+  await expect(page.getByRole('button', { name: /広告を見て復活/ })).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).__ECHO__.reviveInfinite())).toBe(false);
 });
 
 test('all frames initialize distinct weapons with weaker opening balance in both modes', async ({ page }) => {
@@ -444,6 +509,42 @@ test('echo volleys preserve their formation but rotate toward live enemies', asy
     expect(result.echoX).toBe(400);
     expect(result.echoY).toBe(450);
   }
+});
+
+test('WRAITH echo and BASTION combat colors stay distinct from self and elite yellow', async ({ page }) => {
+  const palette = await page.evaluate(async () => {
+    const engine = (window as any).__ECHO__;
+    const shipColors: string[] = [];
+    await engine.start('wraith', 'standard', 'PALETTE-WRAITH', 'infinite');
+    engine.tutorialEnabled = false; engine.player.invulnerable = 0;
+    engine.drawShip = (_ctx: CanvasRenderingContext2D, _x: number, _y: number, _angle: number, color: string) => { shipColors.push(color); };
+    engine.echoes = [{ x: 400, y: 450, angle: 0, alpha: 0.7 }];
+    engine.drawEchoes(engine.ctx, 0);
+    engine.drawPlayer(engine.ctx, 0);
+    const wraith = { echo: shipColors[0], self: shipColors[1] };
+
+    await engine.start('bastion', 'standard', 'PALETTE-BASTION', 'infinite');
+    shipColors.length = 0;
+    engine.tutorialEnabled = false; engine.player.invulnerable = 0;
+    engine.drawPlayer(engine.ctx, 0);
+    engine.projectiles = [];
+    engine.spawnFriendlyShot(engine.player.x, engine.player.y, 0, 50, 'player', 'nova');
+    engine.spawnFriendlyShot(engine.player.x, engine.player.y, 0, 50, 'echo', 'nova');
+    return {
+      wraith,
+      bastionSelf: shipColors[0],
+      bastionShot: engine.projectiles[0].color,
+      bastionEchoShot: engine.projectiles[1].color,
+    };
+  });
+  const wraithColor = CORES.find(core => core.id === 'wraith')!.color;
+  expect(palette.wraith).toEqual({ echo: ECHO_COLOR, self: wraithColor });
+  expect(palette.wraith.echo).not.toBe(palette.wraith.self);
+  expect(palette.bastionSelf).toBe(BASTION_COLOR);
+  expect(palette.bastionShot).toBe(BASTION_COLOR);
+  expect(palette.bastionEchoShot).toBe(ECHO_COLOR);
+  expect(CORES.find(core => core.id === 'bastion')!.color).toBe(BASTION_COLOR);
+  expect(BASTION_COLOR).not.toBe('#ffcf70');
 });
 
 test('boss death stops spawning but requires every remaining enemy before clear and EXP', async ({ page }) => {

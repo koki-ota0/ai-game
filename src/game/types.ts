@@ -130,6 +130,7 @@ export interface RunResult {
   totalXp: number;
   bonusPoints: number;
   firstClear: boolean;
+  reviveAvailable: boolean;
 }
 
 export interface ToastMessage {
@@ -139,6 +140,9 @@ export interface ToastMessage {
   detail?: string;
   tone?: 'cyan' | 'coral' | 'gold';
 }
+
+export const ECHO_COLOR = '#4f8dff';
+export const BASTION_COLOR = '#4df39a';
 
 export const CORES: CoreDefinition[] = [
   {
@@ -174,7 +178,7 @@ export const CORES: CoreDefinition[] = [
     weapon: 'NOVA ARRAY',
     description: '全方位へ新星を放つ重装甲。敵の中心へ飛び込み、残響で弹幕を倍増させる。',
     trait: '全方位射撃 / 高耐久',
-    color: '#ffbd69',
+    color: BASTION_COLOR,
     hp: 130,
     speed: 245,
     damage: 16,
