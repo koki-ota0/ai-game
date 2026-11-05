@@ -22,7 +22,7 @@ export const INFINITE_MAX_SECTOR = 100;
 const STARTING_DAMAGE_MODIFIER = 0.90;
 const INFINITE_STARTING_MODIFIER = { damage: 0.92, fireRate: 0.97, maxHp: 0.97 } as const;
 const INFINITE_ABILITY_COOLDOWN = { dash: 2.8, echo: 12, weapon: 1.2 } as const;
-const INFINITE_DEPTH_SCALING = { health: 1.12, bossHealth: 1.16, spawnRate: 0.03, enemyCap: 3 } as const;
+const INFINITE_DEPTH_SCALING = { health: 1.12, lateHealth: 1.18, bossHealth: 1.16, spawnRate: 0.03, enemyCap: 3 } as const;
 const INFINITE_ROUND_SPAWN_PAUSE = 2.4;
 const ABYSS_MODIFIER = { health: 1.55, bossHealth: 2, spawnRate: 1.4, damage: 1.2, speed: 1.1, enemyCap: 1.2, elite: 0.07 } as const;
 
@@ -87,7 +87,10 @@ interface Particle {
   size: number; color: string; drag: number; shape?: 'line' | 'square';
 }
 interface Pickup { x: number; y: number; vx: number; vy: number; value: number; kind: 'xp' | 'health'; age: number; }
-interface Beam { points: { x: number; y: number }[]; life: number; maxLife: number; color: string; kind?: 'arc' | 'rail'; }
+interface Beam {
+  points: { x: number; y: number }[]; life: number; maxLife: number; color: string; kind?: 'arc' | 'rail';
+  tickDamage?: number; tickTimer?: number;
+}
 interface FloatText { x: number; y: number; text: string; color: string; life: number; size: number; }
 interface Field { x: number; y: number; life: number; maxLife: number; tick: number; }
 interface Player {
@@ -136,7 +139,7 @@ const ANOMALIES: Anomaly[] = [
 ];
 
 export const WEAPON_SKILLS: Record<CoreId, { name: string; enName: string; description: string; cooldown: number }> = {
-  wraith: { name: '貫通レール', enName: 'RAIL LANCE', description: '照準方向の全敵を貫く高威力レール', cooldown: 5 },
+  wraith: { name: '貫通レール', enName: 'RAIL LANCE', description: '照準方向を貫き、1秒間継続ダメージを与える高威力レール', cooldown: 5 },
   tempest: { name: '連鎖サンダー', enName: 'CIRCUIT BREAK', description: '周囲の敵へ雷撃＋短時間の行動停止', cooldown: 7 },
   bastion: { name: 'ノヴァバースト', enName: 'NOVA BURST', description: '周囲へ衝撃波＋敵弾消去＋ノックバック', cooldown: 7 },
 };
@@ -164,6 +167,8 @@ export class GameEngine {
   private status: EngineStatus = 'idle';
   private checkpointNewBest = false;
   private checkpointScore = -1;
+  private checkpointKind: 'sector' | 'build' | null = null;
+  private buildCheckpointShown = false;
   private reviveUsed = false;
   private runCounted = false;
   private core: CoreId = 'wraith';
@@ -239,6 +244,12 @@ export class GameEngine {
 
   private get infiniteDepth() {
     return this.challenge ? 0 : Math.floor((this.sector - 1) / INFINITE_CHECKPOINT_INTERVAL);
+  }
+
+  private get infiniteNormalHealthScale() {
+    const earlyDepth = Math.min(this.infiniteDepth, 2);
+    const lateDepth = Math.max(0, this.infiniteDepth - 2);
+    return Math.pow(INFINITE_DEPTH_SCALING.health, earlyDepth) * Math.pow(INFINITE_DEPTH_SCALING.lateHealth, lateDepth);
   }
 
   private get enemyRosterTier() {
@@ -335,6 +346,7 @@ export class GameEngine {
     this.echoesCreated = 0; this.rerolls = 1; this.nextId = 1; this.seenKinds.clear(); this.bossId = null;
     this.pendingBossDraft = false; this.shotCounter = 0; this.historyTimer = 0;
     this.checkpointNewBest = false; this.checkpointScore = -1;
+    this.checkpointKind = null; this.buildCheckpointShown = false;
     this.reviveUsed = false; this.runCounted = false;
     this.shake = 0; this.flash = 0; this.slowMotion = 0; this.keys.clear();
     this.pointer = { x: W / 2, y: H / 2, down: false, inside: false, manualShots: 0 };
@@ -376,7 +388,15 @@ export class GameEngine {
   pause() { if (this.status === 'running') this.setStatus('paused'); }
 
   continueInfinite() {
-    if (this.status !== 'checkpoint' || this.challenge || this.sector >= INFINITE_MAX_SECTOR) return;
+    if (this.status !== 'checkpoint' || this.challenge) return;
+    if (this.checkpointKind === 'build') {
+      this.checkpointKind = null;
+      this.setStatus('running');
+      this.emitHud();
+      return;
+    }
+    if (this.sector >= INFINITE_MAX_SECTOR) return;
+    this.checkpointKind = null;
     this.advanceInfiniteSector();
     this.setStatus('running');
     this.emitHud();
@@ -447,7 +467,8 @@ export class GameEngine {
     this.pendingBossDraft = false;
     this.callbacks.onDraft(null);
     this.setStatus('running');
-    this.checkLevelUp();
+    if (!this.challenge && !this.hasAvailableUpgrades()) this.openBuildCheckpoint();
+    else this.checkLevelUp();
     this.emitHud();
   }
 
@@ -460,6 +481,7 @@ export class GameEngine {
       gameMode: this.gameMode, challengeLevel: this.challenge?.id ?? 0, reviveUsed: this.reviveUsed,
       initialBonusRanks: this.initialBonusRanks, initialBonuses: { ...this.activeBonuses },
       bossDefeated: this.bossDefeated, remainingEnemies: this.enemies.filter(enemy => !enemy.dead).length,
+      checkpointKind: this.checkpointKind, buildCheckpointShown: this.buildCheckpointShown,
       rift: this.rift ? { x: this.rift.x, y: this.rift.y, progress: this.rift.progress, life: this.rift.life } : null,
       player: this.player ? { x: this.player.x, y: this.player.y } : null,
     };
@@ -609,6 +631,7 @@ export class GameEngine {
     this.updateRift(dt);
     this.updateEnemies(dt);
     this.updateProjectiles(dt);
+    this.updateRailDamage(dt);
     this.updateFields(dt);
     this.updatePickups(dt);
     this.updateEffects(dt);
@@ -753,6 +776,7 @@ export class GameEngine {
             }
             this.checkpointScore = Math.floor(this.score);
             this.checkpointNewBest = this.recordInfiniteRecords();
+            this.checkpointKind = 'sector';
             this.setStatus('checkpoint');
             this.sound.play('level');
             this.emitHud();
@@ -871,7 +895,7 @@ export class GameEngine {
     const elite = eliteOverride || (tier >= 2 && this.random.next() < Math.min(0.28, 0.025 + tier * 0.009 + (this.challenge?.eliteBonus ?? 0) + (this.anomaly?.elite ?? 0) + (this.difficulty === 'abyss' ? ABYSS_MODIFIER.elite : 0)));
     const healthScale = this.challenge
       ? this.challenge.enemyHealth * (1 + this.elapsed * 0.001) * (this.anomaly?.hp ?? 1)
-      : (1 + (this.sector - 1) * 0.2 + this.elapsed * 0.0015) * Math.pow(INFINITE_DEPTH_SCALING.health, this.infiniteDepth) * (this.difficulty === 'abyss' ? ABYSS_MODIFIER.health : 1) * (this.anomaly?.hp ?? 1);
+      : (1 + (this.sector - 1) * 0.2 + this.elapsed * 0.0015) * this.infiniteNormalHealthScale * (this.difficulty === 'abyss' ? ABYSS_MODIFIER.health : 1) * (this.anomaly?.hp ?? 1);
     const hp = baseHp * healthScale * (elite ? 2.8 : 1);
     const damageScale = this.challenge
       ? this.challenge.enemyDamage * (1 + this.elapsed * 0.0005)
@@ -1158,6 +1182,26 @@ export class GameEngine {
     }
   }
 
+  private updateRailDamage(dt: number) {
+    for (const beam of this.beams) {
+      if (beam.kind !== 'rail' || beam.tickDamage === undefined || beam.life <= 0) continue;
+      const [start, end] = beam.points;
+      if (!start || !end) continue;
+      beam.tickTimer = (beam.tickTimer ?? 0.3) - Math.min(dt, beam.life);
+      let hits = 0;
+      while (beam.tickTimer <= 0) {
+        beam.tickTimer += 0.3;
+        for (const enemy of this.enemies) {
+          if (!enemy.dead && distanceToSegment(enemy.x, enemy.y, start.x, start.y, end.x, end.y) < enemy.radius + 24) {
+            this.damageEnemy(enemy, beam.tickDamage, 'player');
+            hits++;
+          }
+        }
+      }
+      if (hits > 0) this.sound.play('arc', 0.3);
+    }
+  }
+
   private updateEffects(dt: number) {
     for (const particle of this.particles) {
       particle.life -= dt;
@@ -1184,7 +1228,10 @@ export class GameEngine {
     if (this.core === 'wraith') {
       const endX = p.x + Math.cos(angle) * 1250;
       const endY = p.y + Math.sin(angle) * 1250;
-      this.beams.push({ points: [{ x: p.x, y: p.y }, { x: endX, y: endY }], life: 0.28, maxLife: 0.28, color: '#8dfff3', kind: 'rail' });
+      this.beams.push({
+        points: [{ x: p.x, y: p.y }, { x: endX, y: endY }],
+        life: 1, maxLife: 1, color: '#8dfff3', kind: 'rail', tickDamage: p.stats.damage * 0.75, tickTimer: 0.3,
+      });
       for (const enemy of this.enemies) {
         if (!enemy.dead && distanceToSegment(enemy.x, enemy.y, p.x, p.y, endX, endY) < enemy.radius + 24) {
           this.damageEnemy(enemy, p.stats.damage * 6, 'player');
@@ -1528,6 +1575,15 @@ export class GameEngine {
     return target;
   }
 
+  private availableUpgrades() {
+    return UPGRADES.filter(upgrade =>
+      (this.stacks[upgrade.id] ?? 0) < upgrade.maxStacks &&
+      (!upgrade.cores || upgrade.cores.includes(this.core))
+    );
+  }
+
+  private hasAvailableUpgrades() { return this.availableUpgrades().length > 0; }
+
   private checkLevelUp() {
     if (this.status !== 'running' || this.pendingBossDraft) return;
     const p = this.player;
@@ -1536,12 +1592,30 @@ export class GameEngine {
       this.level++;
       p.level = this.level;
       p.xpNext = Math.floor(30 + (this.level - 1) * 22 + Math.pow(this.level - 1, 2) * 3);
-      this.openDraft('level');
+      if (this.hasAvailableUpgrades()) this.openDraft('level');
+      else if (!this.challenge) this.openBuildCheckpoint();
     }
+  }
+
+  private openBuildCheckpoint() {
+    if (this.status !== 'running' || this.challenge || this.buildCheckpointShown) return;
+    this.buildCheckpointShown = true;
+    this.pendingBossDraft = false;
+    this.checkpointScore = Math.floor(this.score);
+    this.checkpointNewBest = this.recordInfiniteRecords();
+    this.checkpointKind = 'build';
+    this.setStatus('checkpoint');
+    this.sound.play('level');
+    this.emitHud();
   }
 
   private openDraft(reason: 'level' | 'boss') {
     if (this.status !== 'running') return;
+    if (!this.hasAvailableUpgrades()) {
+      this.pendingBossDraft = false;
+      if (!this.challenge) this.openBuildCheckpoint();
+      return;
+    }
     this.pendingBossDraft = reason === 'boss';
     this.setStatus('draft');
     this.sound.play('level');
@@ -1549,10 +1623,7 @@ export class GameEngine {
   }
 
   private makeDraft(reason: 'level' | 'boss'): DraftState {
-    const available = UPGRADES.filter(upgrade =>
-      (this.stacks[upgrade.id] ?? 0) < upgrade.maxStacks &&
-      (!upgrade.cores || upgrade.cores.includes(this.core))
-    );
+    const available = this.availableUpgrades();
     const choices: UpgradeDefinition[] = [];
     const pool = [...available];
     while (choices.length < 3 && pool.length) {
@@ -1662,6 +1733,7 @@ export class GameEngine {
       gameMode: this.gameMode, challengeLevel: this.challenge?.id ?? 0,
       challengeName: this.challenge?.name ?? '', challengeDuration: this.challenge?.combatDuration ?? 0,
       challengeCleanup: this.bossDefeated,
+      checkpointKind: this.checkpointKind,
       remainingEnemies: this.enemies.filter(enemy => !enemy.dead).length,
       initialBonusRanks: this.initialBonusRanks,
     });

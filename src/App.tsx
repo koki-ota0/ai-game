@@ -518,18 +518,22 @@ function App() {
         <section className="modal-layer pause-layer checkpoint-layer">
           <div className="pause-panel glass-panel checkpoint-panel">
             <div className="pause-icon checkpoint-icon"><Check size={28} /></div>
-            <small>TIMELINE CHECKPOINT // SCORE SAVED</small>
-            <h2>SECTOR {String(hud.sector).padStart(2, '0')}</h2>
-            <p>ここで終えるか、さらに深部へ進むか選択できます。</p>
+            <small>{hud.checkpointKind === 'build' ? 'ALL UPGRADES ACQUIRED // SCORE SAVED' : 'TIMELINE CHECKPOINT // SCORE SAVED'}</small>
+            <h2>{hud.checkpointKind === 'build' ? 'BUILD COMPLETE' : `SECTOR ${String(hud.sector).padStart(2, '0')}`}</h2>
+            <p>{hud.checkpointKind === 'build' ? '適用可能な進化をすべて取得しました。現在のスコアを記録し、このビルドで潜行を続けるか終了できます。' : 'ここで終えるか、さらに深部へ進むか選択できます。'}</p>
             <div className="pause-stats">
               <span>SCORE <b>{number(hud.score)}</b></span>
               <span>ERASED <b>{number(hud.kills)}</b></span>
-              <span>NEXT <b>{String(hud.sector + 1).padStart(2, '0')}</b></span>
+              {hud.checkpointKind === 'build'
+                ? <span>BUILD <b>MAX</b></span>
+                : <span>NEXT <b>{String(hud.sector + 1).padStart(2, '0')}</b></span>}
             </div>
             <div className="checkpoint-record"><Check size={14} /> 現在の得点と最深セクターを記録しました</div>
-            <button className="primary-button" onClick={() => engineRef.current?.continueInfinite()}><ArrowRight size={18} /> セクター{String(hud.sector + 1).padStart(2, '0')}へ進む <span>CONTINUE</span></button>
+            <button className="primary-button" onClick={() => engineRef.current?.continueInfinite()}>
+              <ArrowRight size={18} /> {hud.checkpointKind === 'build' ? 'このビルドで戦闘を続ける' : `セクター${String(hud.sector + 1).padStart(2, '0')}へ進む`} <span>CONTINUE</span>
+            </button>
             <button className="secondary-button" onClick={() => engineRef.current?.finishInfinite()}><Trophy size={17} /> ここで終了して結果を確定</button>
-            <small className="checkpoint-limit">{INFINITE_CHECKPOINT_INTERVAL}セクターごとに選択 // 最大{INFINITE_MAX_SECTOR}セクター</small>
+            <small className="checkpoint-limit">{hud.checkpointKind === 'build' ? '全進化取得済み // 以後の進化ドラフトは発生しません' : `${INFINITE_CHECKPOINT_INTERVAL}セクターごとに選択 // 最大${INFINITE_MAX_SECTOR}セクター`}</small>
           </div>
         </section>
       )}
