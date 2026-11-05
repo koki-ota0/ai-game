@@ -1,6 +1,7 @@
 import { test, expect } from '@playwright/test';
 import { SoundSystem } from '../src/game/audio';
 import { BASTION_COLOR, CORES, ECHO_COLOR } from '../src/game/types';
+import { UPGRADES } from '../src/game/upgrades';
 
 const snapshot = async (page: import('@playwright/test').Page) =>
   page.evaluate(() => (window as any).__ECHO__.getDebugSnapshot());
@@ -609,6 +610,80 @@ test('boss death stops spawning but requires every remaining enemy before clear 
   expect(errors).toEqual([]);
 });
 
+test('completed builds save a checkpoint and never open empty XP or boss drafts', async ({ page }) => {
+  const errors: string[] = [];
+  page.on('pageerror', error => errors.push(error.message));
+  const stacks = Object.fromEntries(UPGRADES.map(upgrade => [upgrade.id, upgrade.id === 'amplifier' ? upgrade.maxStacks - 1 : upgrade.maxStacks]));
+  const openFinalUpgrade = async (seed: string, gameMode: 'infinite' | 'level' = 'infinite') => {
+    await page.evaluate(async ({ seed, gameMode, stacks }) => {
+      const engine = (window as any).__ECHO__;
+      await engine.start('wraith', 'standard', seed, gameMode, 1);
+      engine.enemies = [];
+      engine.score = 1234.75;
+      engine.stacks = { ...stacks };
+      engine.openDraft('level');
+    }, { seed, gameMode, stacks });
+    await expect(page.locator('.upgrade-card')).toHaveCount(1);
+  };
+
+  await openFinalUpgrade('BUILD-FINISH');
+  await page.locator('.upgrade-card').click();
+  await expect(page.getByRole('heading', { name: 'BUILD COMPLETE' })).toBeVisible();
+  expect((await snapshot(page)).checkpointKind).toBe('build');
+  expect((await snapshot(page)).buildCheckpointShown).toBe(true);
+  expect(await page.evaluate(() => localStorage.getItem('echo-abyss-best-standard'))).toBe('1234');
+  await page.getByRole('button', { name: /ここで終了して結果を確定/ }).click();
+  await expect(page.getByRole('heading', { name: 'TIME CLEAR' })).toBeVisible();
+  await expect(page.locator('.final-score')).toContainText('1,234');
+
+  await openFinalUpgrade('BUILD-CONTINUE');
+  await page.locator('.upgrade-card').click();
+  await expect(page.getByRole('heading', { name: 'BUILD COMPLETE' })).toBeVisible();
+  const sectorBeforeContinue = (await snapshot(page)).sector;
+  await page.getByRole('button', { name: /このビルドで戦闘を続ける/ }).click();
+  await expect.poll(async () => (await snapshot(page)).status).toBe('running');
+  expect((await snapshot(page)).sector).toBe(sectorBeforeContinue);
+  expect((await snapshot(page)).buildCheckpointShown).toBe(true);
+
+  const afterXp = await page.evaluate(() => {
+    const engine = (window as any).__ECHO__;
+    engine.player.xp = engine.player.xpNext;
+    engine.checkLevelUp();
+    return { status: engine.status, level: engine.level, checkpointKind: engine.checkpointKind, pendingBossDraft: engine.pendingBossDraft };
+  });
+  expect(afterXp).toEqual({ status: 'running', level: 2, checkpointKind: null, pendingBossDraft: false });
+  await expect(page.locator('.draft-layer')).toHaveCount(0);
+
+  const afterBoss = await page.evaluate(() => {
+    const engine = (window as any).__ECHO__;
+    engine.enemies = [];
+    engine.spawnBoss();
+    const boss = engine.enemies.find((enemy: any) => enemy.kind === 'boss');
+    boss.hp = 1;
+    engine.damageEnemy(boss, 10, 'player');
+    engine.update(0);
+    return { status: engine.status, checkpointKind: engine.checkpointKind, pendingBossDraft: engine.pendingBossDraft };
+  });
+  expect(afterBoss).toEqual({ status: 'running', checkpointKind: null, pendingBossDraft: false });
+  await expect(page.locator('.draft-layer')).toHaveCount(0);
+
+  await openFinalUpgrade('LEVEL-NO-BUILD-CHECKPOINT', 'level');
+  await page.locator('.upgrade-card').click();
+  await expect.poll(async () => (await snapshot(page)).status).toBe('running');
+  const levelState = await page.evaluate(() => {
+    const engine = (window as any).__ECHO__;
+    engine.player.xp = engine.player.xpNext;
+    engine.checkLevelUp();
+    engine.pendingBossDraft = true;
+    engine.openDraft('boss');
+    return { status: engine.status, checkpointKind: engine.checkpointKind, pendingBossDraft: engine.pendingBossDraft };
+  });
+  expect(levelState).toEqual({ status: 'running', checkpointKind: null, pendingBossDraft: false });
+  await expect(page.locator('.checkpoint-panel')).toHaveCount(0);
+  await expect(page.locator('.draft-layer')).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+
 test('INFINITE saves checkpoints every 10 sectors and allows continue or finish through 100', async ({ page }) => {
   const errors: string[] = [];
   page.on('pageerror', error => errors.push(error.message));
@@ -723,6 +798,72 @@ test('INFINITE round transitions thin enemies and pause regular and boss spawns'
   expect(transition.waiting.boss).toBe(false);
   expect(transition.opened).toEqual({ boss: true, enemies: 8 });
   expect(transition.kills).toBe(0);
+});
+
+test('WRAITH rail keeps its impact and adds three sustained damage ticks over one second', async ({ page }) => {
+  const result = await page.evaluate(async () => {
+    const engine = (window as any).__ECHO__;
+    await engine.start('wraith', 'standard', 'RAIL-SUSTAINED', 'infinite');
+    engine.tutorialEnabled = false;
+    engine.enemies = [];
+    engine.player.fireTimer = 999;
+    engine.player.angle = 0;
+    engine.pointer.inside = false;
+    engine.random.next = () => 0.99;
+    engine.spawnEnemy('tank', engine.player.x + 150, engine.player.y, false);
+    const target = engine.enemies[0];
+    const initialHp = target.hp;
+    engine.useWeaponSkill();
+    const afterImpact = target.hp;
+    const beam = engine.beams.find((candidate: any) => candidate.kind === 'rail');
+    const samples = [afterImpact];
+    for (let step = 0; step < 4; step++) {
+      engine.updateRailDamage(0.3);
+      engine.updateEffects(0.3);
+      samples.push(target.hp);
+    }
+    return {
+      initialHp, afterImpact, samples, damage: engine.player.stats.damage,
+      tickDamage: beam.tickDamage, duration: beam.maxLife, lifeAfter: beam.life,
+    };
+  });
+  expect(result.afterImpact).toBeCloseTo(result.initialHp - result.damage * 6, 6);
+  expect(result.tickDamage).toBeCloseTo(result.damage * 0.75, 6);
+  expect(result.duration).toBe(1);
+  expect(result.samples[1]).toBeCloseTo(result.afterImpact - result.tickDamage, 6);
+  expect(result.samples[2]).toBeCloseTo(result.afterImpact - result.tickDamage * 2, 6);
+  expect(result.samples[3]).toBeCloseTo(result.afterImpact - result.tickDamage * 3, 6);
+  expect(result.samples[4]).toBeCloseTo(result.samples[3], 6);
+  expect(result.lifeAfter).toBeLessThanOrEqual(0);
+});
+
+test('normal enemies gain extra durability after round 30 without changing boss or attack scaling', async ({ page }) => {
+  const measure = async (sector: number) => page.evaluate(async ({ sector }) => {
+    const engine = (window as any).__ECHO__;
+    await engine.start('wraith', 'standard', `LATE-HP-${sector}`, 'infinite');
+    engine.elapsed = 0; engine.sector = sector; engine.enemies = []; engine.anomaly = null;
+    engine.random.next = () => 0.99;
+    engine.spawnEnemy('tank', 500, 500, false);
+    engine.spawnBoss();
+    const tank = engine.enemies.find((enemy: any) => enemy.kind === 'tank');
+    const boss = engine.enemies.find((enemy: any) => enemy.kind === 'boss');
+    return { hp: tank.maxHp, damage: tank.damage, bossHp: boss.maxHp };
+  }, { sector });
+  const normalHp = (sector: number) => 240 * (1 + (sector - 1) * 0.2);
+  const lateScale = (sector: number) => {
+    const depth = Math.floor((sector - 1) / 10);
+    return Math.pow(1.12, Math.min(depth, 2)) * Math.pow(1.18, Math.max(0, depth - 2));
+  };
+  for (const sector of [30, 31, 41, 99]) {
+    const state = await measure(sector);
+    expect(state.hp).toBeCloseTo(normalHp(sector) * lateScale(sector), 5);
+    expect(state.damage).toBeCloseTo(22 * (1 + (sector - 1) * 0.055), 5);
+    expect(state.bossHp).toBeCloseTo(1250 * (1 + (Math.floor(sector / 3) - 1) * 0.82) * Math.pow(1.16, Math.floor((sector - 1) / 10)), 5);
+  }
+  const round30 = await measure(30);
+  const round31 = await measure(31);
+  expect(round31.hp / (normalHp(31) * Math.pow(1.12, 2))).toBeCloseTo(1.18, 6);
+  expect(round30.hp).toBeCloseTo(normalHp(30) * Math.pow(1.12, 2), 5);
 });
 
 test('INFINITE depth and ABYSS scaling increase pressure without runaway attack damage', async ({ page }) => {

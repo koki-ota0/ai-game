@@ -107,6 +107,7 @@ export interface HudState {
   challengeName: string;
   challengeDuration: number;
   challengeCleanup: boolean;
+  checkpointKind: 'sector' | 'build' | null;
   remainingEnemies: number;
   initialBonusRanks: number;
 }
