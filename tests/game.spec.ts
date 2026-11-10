@@ -2,6 +2,9 @@ import { test, expect } from '@playwright/test';
 import { SoundSystem } from '../src/game/audio';
 import { BASTION_COLOR, CORES, ECHO_COLOR } from '../src/game/types';
 import { UPGRADES } from '../src/game/upgrades';
+import { BOSS_DEFINITIONS } from '../src/game/bosses';
+import { getRunXpRequirement } from '../src/game/GameEngine';
+import { getBonusInvestedXp, getBonusUpgradeCost, getStageXp, TOTAL_BONUS_RANKS } from '../src/game/campaign';
 
 const snapshot = async (page: import('@playwright/test').Page) =>
   page.evaluate(() => (window as any).__ECHO__.getDebugSnapshot());
@@ -200,11 +203,10 @@ test('all frames initialize distinct weapons with weaker opening balance in both
       await engine.start(core, 'standard', `LEVEL-BASE-${core}`, 'level', 1);
       return { damage: engine.player.stats.damage, fireRate: engine.player.stats.fireRate, maxHp: engine.player.stats.maxHp, dashCooldown: engine.player.stats.dashCooldown, echoCooldown: engine.player.stats.echoCooldown, weaponSkillCooldown: engine.weaponSkillCooldown };
     }, { core });
-    // LEVEL keeps its previous, lower opening rather than inheriting the new
-    // INFINITE-only nerf. Persistent bonuses are still applied afterwards.
-    expect(levelBase.damage).toBeCloseTo(frame.damage * 0.9 * 0.9, 6);
-    expect(levelBase.fireRate).toBeCloseTo(frame.fireRate * 0.95, 6);
-    expect(levelBase.maxHp).toBe(Math.round(frame.hp * 0.95));
+    // LEVEL starts weaker than INFINITE; persistent bonuses apply afterwards.
+    expect(levelBase.damage).toBeCloseTo(frame.damage * 0.9 * 0.88, 6);
+    expect(levelBase.fireRate).toBeCloseTo(frame.fireRate * 0.92, 6);
+    expect(levelBase.maxHp).toBe(Math.round(frame.hp * 0.9));
     expect(levelBase.damage).toBeLessThan(state.damage);
     expect(levelBase.fireRate).toBeLessThan(state.fireRate);
     expect(levelBase.maxHp).toBeLessThan(state.hp);
@@ -284,7 +286,7 @@ test('manual fire, left/right mouse chords, all weapon skills, and pilot link wo
   await expect.poll(async () => (await snapshot(page)).manualShots).toBeGreaterThan(0);
   await page.keyboard.press('Space');
   await page.keyboard.press('e');
-  await page.keyboard.press('r');
+  await page.keyboard.press('q');
   await expect.poll(async () => (await snapshot(page)).weaponCooldown).toBeGreaterThan(0);
   await expect.poll(async () => (await snapshot(page)).tutorialStep).toBe(5);
   await page.evaluate(() => { (window as any).__ECHO__.player.weaponCooldown = 0; });
@@ -295,7 +297,7 @@ test('manual fire, left/right mouse chords, all weapon skills, and pilot link wo
   expect((await snapshot(page)).manualShots).toBeGreaterThan(shotsBeforeChord);
   await page.mouse.up({ button: 'right' });
   await page.mouse.up({ button: 'left' });
-  await expect(page.getByRole('button', { name: /R: 貫通レール/ })).toBeVisible();
+  await expect(page.getByRole('button', { name: /Q: 貫通レール/ })).toBeVisible();
 
   for (const core of ['tempest', 'bastion']) {
     await page.evaluate(({ core }) => {
@@ -307,7 +309,7 @@ test('manual fire, left/right mouse chords, all weapon skills, and pilot link wo
       const engine = (window as any).__ECHO__;
       engine.spawnEnemy('tank', engine.player.x + 130, engine.player.y, false);
     });
-    await page.keyboard.press('r');
+    await page.keyboard.press('q');
     await expect.poll(async () => (await snapshot(page)).weaponCooldown).toBeGreaterThan(0);
     const effect = await page.evaluate(() => {
       const engine = (window as any).__ECHO__;
@@ -317,6 +319,42 @@ test('manual fire, left/right mouse chords, all weapon skills, and pilot link wo
     else expect(effect.shockwaves).toBeGreaterThan(0);
   }
   expect(errors).toEqual([]);
+});
+
+test('action dock runs Q, E, R left to right and each key fires its own ability', async ({ page }) => {
+  await page.evaluate(() => (window as any).__ECHO__.start('wraith', 'standard', 'HOTKEY-ORDER'));
+  await expect.poll(async () => (await snapshot(page)).status).toBe('running');
+
+  const dock = page.locator('.ability-dock .ability');
+  await expect(dock).toHaveCount(4);
+  const labels = await dock.evaluateAll(nodes => nodes.map(node => node.querySelector('kbd')?.textContent ?? ''));
+  expect(labels).toEqual(['SPACE', 'Q', 'E', 'R']);
+
+  // SPACE / Q / E / R must line up with the on-screen buttons from left to right.
+  for (const [index, key] of [[1, 'q'], [2, 'e'], [3, 'r']] as const) {
+    expect(labels[index]).toBe(key.toUpperCase());
+  }
+
+  const pilot = () => page.evaluate(() => {
+    const engine = (window as any).__ECHO__;
+    return { overdrive: engine.player.overdrive as number, sync: engine.player.sync as number };
+  });
+
+  // Q = weapon skill only
+  await page.keyboard.press('q');
+  await expect.poll(async () => (await snapshot(page)).weaponCooldown).toBeGreaterThan(0);
+  await expect.poll(async () => (await snapshot(page)).echoes).toBe(0);
+  expect((await pilot()).overdrive).toBe(0);
+
+  // E = echo summon only
+  await page.keyboard.press('e');
+  await expect.poll(async () => (await snapshot(page)).echoes).toBeGreaterThan(0);
+  expect((await pilot()).overdrive).toBe(0);
+
+  // R = ZERO FIELD
+  await page.evaluate(() => { const engine = (window as any).__ECHO__; engine.player.sync = 100; });
+  await page.keyboard.press('r');
+  await expect.poll(async () => (await pilot()).overdrive).toBeGreaterThan(0);
 });
 
 test('SYNC RIFT retains progress outside and resumes in both modes', async ({ page }) => {
@@ -548,14 +586,295 @@ test('WRAITH echo and BASTION combat colors stay distinct from self and elite ye
   expect(BASTION_COLOR).not.toBe('#ffcf70');
 });
 
+test('four bosses rotate across both modes without changing HP scaling or the final AION', async ({ page }) => {
+  const infinite = [];
+  for (const sector of [3, 6, 9, 12, 99]) {
+    infinite.push(await page.evaluate(async ({ sector }) => {
+      const engine = (window as any).__ECHO__;
+      await engine.start('wraith', 'standard', `BOSS-ROTATION-${sector}`, 'infinite');
+      engine.enemies = []; engine.sector = sector; engine.spawnBoss();
+      const boss = engine.enemies.find((enemy: any) => enemy.kind === 'boss');
+      engine.render(1);
+      const pixels = engine.canvas.toDataURL();
+      let renderHash = 0;
+      for (let index = 0; index < pixels.length; index++) renderHash = (renderHash * 31 + pixels.charCodeAt(index)) >>> 0;
+      return { sector, kind: boss.bossKind, hp: boss.maxHp, renderHash };
+    }, { sector }));
+  }
+  expect(infinite.map(state => state.kind)).toEqual(['warden', 'lancer', 'choir', 'colossus', 'warden']);
+  expect(new Set(infinite.slice(0, 4).map(state => state.renderHash)).size).toBe(4);
+  for (const state of infinite) {
+    const tier = Math.max(1, Math.floor(state.sector / 3));
+    const depth = Math.floor((state.sector - 1) / 10);
+    expect(state.hp).toBeCloseTo(1250 * (1 + (tier - 1) * 0.82) * Math.pow(1.16, depth), 5);
+  }
+
+  const levels = await page.evaluate(async () => {
+    const engine = (window as any).__ECHO__;
+    const states = [];
+    for (const stage of [5, 10, 15, 20, 25, 100]) {
+      await engine.start('wraith', 'standard', `BOSS-LEVEL-${stage}`, 'level', stage);
+      engine.enemies = []; engine.spawnBoss();
+      const boss = engine.enemies.find((enemy: any) => enemy.kind === 'boss');
+      states.push({ stage, kind: boss.bossKind, hp: boss.maxHp, expectedHp: 1250 * (1 + (engine.bossTier - 1) * 0.82) * engine.challenge.bossHealth });
+    }
+    return states;
+  });
+  expect(levels.map(state => state.kind)).toEqual(['warden', 'lancer', 'choir', 'colossus', 'warden', 'warden']);
+  for (const state of levels) expect(state.hp).toBeCloseTo(state.expectedHp, 5);
+});
+
+test('KAIROS telegraphs fast piercing shots before alternating into a locked dash', async ({ page }) => {
+  const result = await page.evaluate(async () => {
+    const engine = (window as any).__ECHO__;
+    await engine.start('wraith', 'standard', 'LANCER-ATTACKS', 'infinite');
+    engine.enemies = []; engine.projectiles = []; engine.spawnBoss('lancer');
+    const boss = engine.enemies[0];
+    boss.x = 800; boss.y = 200; boss.angle = Math.PI / 2; boss.fireTimer = 0;
+    engine.player.x = 800; engine.player.y = 450;
+    engine.updateBoss(boss, 0, 0, 1, 250);
+    const shotTelegraph = boss.telegraph;
+    const lockedAngle = boss.lockedAngle;
+    engine.updateBoss(boss, shotTelegraph, 0, 1, 250);
+    const shots = engine.projectiles.map((projectile: any) => ({
+      color: projectile.color, speed: Math.hypot(projectile.vx, projectile.vy), angle: Math.atan2(projectile.vy, projectile.vx),
+    }));
+    engine.projectiles = []; boss.fireTimer = 0;
+    engine.updateBoss(boss, 0, 0, 1, 250);
+    const dashTelegraph = boss.telegraph;
+    engine.updateBoss(boss, dashTelegraph, 0, 1, 250);
+    return {
+      shotTelegraph, dashTelegraph, lockedAngle, shots, specialTimer: boss.specialTimer,
+      dashSpeed: Math.hypot(boss.vx, boss.vy), dashAngle: Math.atan2(boss.vy, boss.vx),
+    };
+  });
+  expect(result.shotTelegraph).toBeGreaterThan(0.8);
+  expect(result.dashTelegraph).toBeGreaterThan(0.8);
+  expect(result.lockedAngle).toBeCloseTo(Math.PI / 2, 6);
+  expect(result.shots).toHaveLength(5);
+  for (const shot of result.shots) {
+    expect(shot.color).toBe(BOSS_DEFINITIONS.lancer.color);
+    expect(shot.speed).toBeGreaterThan(400);
+    expect(Math.abs(shot.angle - Math.PI / 2)).toBeLessThanOrEqual(0.25);
+  }
+  expect(result.specialTimer).toBeGreaterThan(0);
+  expect(result.dashSpeed).toBeGreaterThan(600);
+  expect(result.dashAngle).toBeCloseTo(Math.PI / 2, 6);
+});
+
+test('NEXUS fires a colored double spiral and caps its weaver summons', async ({ page }) => {
+  const result = await page.evaluate(async () => {
+    const engine = (window as any).__ECHO__;
+    await engine.start('wraith', 'standard', 'CHOIR-ATTACKS', 'infinite');
+    engine.enemies = []; engine.projectiles = []; engine.spawnBoss('choir');
+    const boss = engine.enemies[0];
+    boss.fireTimer = 0;
+    engine.updateBoss(boss, 0, 1, 0, 400);
+    const spiral = engine.projectiles.map((projectile: any) => ({ color: projectile.color, angle: Math.atan2(projectile.vy, projectile.vx) }));
+    engine.projectiles = []; boss.fireTimer = 0;
+    engine.updateBoss(boss, 0, 1, 0, 400);
+    const satelliteShots = engine.projectiles.length;
+    const summons = [];
+    for (let attempt = 0; attempt < 3; attempt++) {
+      boss.pattern = 2; boss.fireTimer = 0; engine.projectiles = [];
+      engine.updateBoss(boss, 0, 1, 0, 400);
+      summons.push(engine.enemies.filter((enemy: any) => enemy.kind === 'weaver').length);
+    }
+    return { spiral, satelliteShots, summons };
+  });
+  expect(result.spiral).toHaveLength(16);
+  expect(new Set(result.spiral.map((shot: { angle: number }) => Math.round(shot.angle * 100))).size).toBeGreaterThan(8);
+  expect(result.spiral.every((shot: { color: string }) => shot.color === BOSS_DEFINITIONS.choir.color)).toBe(true);
+  expect(result.satelliteShots).toBe(6);
+  expect(result.summons).toEqual([1, 2, 2]);
+});
+
+test('ATLAS telegraphs its shockwave and only damages targets inside the warning circle', async ({ page }) => {
+  const result = await page.evaluate(async () => {
+    const engine = (window as any).__ECHO__;
+    await engine.start('wraith', 'standard', 'COLOSSUS-ATTACKS', 'infinite');
+    engine.enemies = []; engine.projectiles = []; engine.shockwaves = []; engine.spawnBoss('colossus');
+    const boss = engine.enemies[0];
+    boss.x = 800; boss.y = 200; boss.fireTimer = 0;
+    engine.player.x = 800; engine.player.y = 400; engine.player.hp = 100;
+    engine.player.invulnerable = 0; engine.player.shieldReady = false;
+    engine.updateBoss(boss, 0, 0, 1, 200);
+    const initialTelegraph = boss.telegraph;
+    engine.updateBoss(boss, 0.5, 0, 1, 200);
+    const hpDuringWarning = engine.player.hp;
+    engine.updateBoss(boss, 0.6, 0, 1, 200);
+    const inside = {
+      hp: engine.player.hp, waves: engine.shockwaves.length, shots: engine.projectiles.length,
+      colors: engine.projectiles.map((projectile: any) => projectile.color),
+    };
+    engine.player.hp = 100; engine.player.invulnerable = 0; engine.player.x = 1400; engine.player.y = 800;
+    engine.projectiles = []; engine.shockwaves = [];
+    boss.pattern = 0; boss.fireTimer = 0; boss.telegraph = 0;
+    engine.updateBoss(boss, 0, 0, 1, 800);
+    engine.drawEnemies(engine.ctx, 1);
+    engine.updateBoss(boss, 1.1, 0, 1, 800);
+    return { initialTelegraph, hpDuringWarning, inside, outsideHp: engine.player.hp, outsideWaves: engine.shockwaves.length };
+  });
+  expect(result.initialTelegraph).toBeCloseTo(1.05, 6);
+  expect(result.hpDuringWarning).toBe(100);
+  expect(result.inside.hp).toBeLessThan(100);
+  expect(result.inside.waves).toBe(1);
+  expect(result.inside.shots).toBe(12);
+  expect(result.inside.colors.every((color: string) => color === BOSS_DEFINITIONS.colossus.color)).toBe(true);
+  expect(result.outsideHp).toBe(100);
+  expect(result.outsideWaves).toBe(1);
+});
+
+test('LEVEL bosses appear only every fifth stage and normal stages require cleanup', async ({ page }) => {
+  const schedule = await page.evaluate(async () => {
+    const engine = (window as any).__ECHO__;
+    const states = [];
+    for (const stage of [1, 4, 5, 6, 9, 10, 95, 100]) {
+      await engine.start('wraith', 'standard', `BOSS-SCHEDULE-${stage}`, 'level', stage);
+      engine.enemies = []; engine.sectorTime = engine.challenge.combatDuration; engine.spawnTimer = 999;
+      engine.updateDirector(0);
+      states.push({
+        stage, hasBoss: engine.challenge.hasBoss, cleanupStarted: engine.cleanupStarted,
+        boss: engine.enemies.some((enemy: any) => enemy.kind === 'boss'),
+      });
+    }
+    return states;
+  });
+  for (const state of schedule) {
+    expect(state.hasBoss).toBe(state.stage % 5 === 0);
+    expect(state.boss).toBe(state.stage % 5 === 0);
+    expect(state.cleanupStarted).toBe(state.stage % 5 !== 0);
+  }
+
+  const clear = await page.evaluate(async () => {
+    const engine = (window as any).__ECHO__;
+    await engine.start('wraith', 'standard', 'NORMAL-STAGE-CLEANUP', 'level', 1);
+    engine.tutorialEnabled = false; engine.enemies = []; engine.echoes = []; engine.player.fireTimer = 999;
+    engine.sectorTime = engine.challenge.combatDuration;
+    engine.spawnEnemy('drone', 250, 200, false); engine.spawnEnemy('dart', 1350, 700, false);
+    engine.spawnTimer = 0; engine.updateDirector(0);
+    const before = {
+      bossSpawned: engine.bossSpawned, bossDefeated: engine.bossDefeated,
+      cleanupStarted: engine.cleanupStarted, enemies: engine.enemies.length,
+    };
+    engine.update(0);
+    const waiting = { status: engine.status, enemies: engine.enemies.length };
+    for (const enemy of engine.enemies) engine.damageEnemy(enemy, enemy.maxHp * 10, 'player');
+    engine.update(0);
+    return {
+      before, waiting, status: engine.status,
+      xp: Number(localStorage.getItem('echo-abyss-campaign-xp') ?? 0),
+      unlocked: Number(localStorage.getItem('echo-abyss-unlocked-level') ?? 1),
+    };
+  });
+  expect(clear.before).toEqual({ bossSpawned: false, bossDefeated: false, cleanupStarted: true, enemies: 2 });
+  expect(clear.waiting).toEqual({ status: 'running', enemies: 2 });
+  expect(clear.status).toBe('gameover');
+  expect(clear.xp).toBe(132);
+  expect(clear.unlocked).toBe(2);
+  await expect(page.getByRole('heading', { name: 'LEVEL CLEAR' })).toBeVisible();
+});
+
+test('XP costs rise steadily while stage rewards and enemy shards scale without runaway growth', async ({ page }) => {
+  const levels = [1, 2, 3, 4, 5, 10, 20];
+  const requirements = levels.map(getRunXpRequirement);
+  expect(requirements).toEqual([30, 58, 94, 138, 190, 570, 1930]);
+  for (let index = 1; index < requirements.length; index++) expect(requirements[index]!).toBeGreaterThan(requirements[index - 1]!);
+
+  expect(getStageXp(1, true)).toBe(132);
+  expect(getStageXp(5, true)).toBe(185);
+  expect(getStageXp(100, true)).toBe(3120);
+  expect(getStageXp(1, false)).toBe(46);
+  expect(getStageXp(100, false)).toBe(1092);
+  let firstClearTotal = 0;
+  for (let stage = 1; stage <= 100; stage++) firstClearTotal += getStageXp(stage, true);
+  expect(firstClearTotal).toBe(133508);
+  expect(getBonusUpgradeCost('damage', 0)).toBe(100);
+  expect(getBonusUpgradeCost('damage', 1)).toBe(138);
+  expect(getBonusUpgradeCost('damage', 2)).toBe(212);
+  expect(getBonusUpgradeCost('damage', 19)).toBe(6978);
+  expect(getBonusUpgradeCost('damage', 20)).toBeNull();
+  expect(getBonusUpgradeCost('fireRate', 0)).toBe(110);
+  expect(getBonusUpgradeCost('vitality', 0)).toBe(120);
+  expect(getBonusUpgradeCost('mobility', 0)).toBe(80);
+  for (const id of ['damage', 'fireRate', 'vitality', 'echoDamage', 'mobility', 'xpGain'] as const) {
+    for (let rank = 1; rank < 20; rank++) expect(getBonusUpgradeCost(id, rank)!).toBeGreaterThan(getBonusUpgradeCost(id, rank - 1)!);
+  }
+  const maxLoadout = Object.fromEntries(['damage', 'fireRate', 'vitality', 'echoDamage', 'mobility', 'xpGain'].map(id => [id, 20]));
+  expect(getBonusInvestedXp(maxLoadout)).toBe(301560);
+  expect(TOTAL_BONUS_RANKS).toBe(120);
+
+  const drops = await page.evaluate(async () => {
+    const engine = (window as any).__ECHO__;
+    const states = [];
+    for (const stage of [1, 50, 100]) {
+      await engine.start('wraith', 'standard', `XP-DROP-${stage}`, 'level', stage);
+      engine.anomaly = null; engine.enemies = []; engine.random.next = () => 1;
+      engine.spawnEnemy('drone', 400, 400, false);
+      states.push({ stage, scale: engine.challenge.enemyXp, xp: engine.enemies[0].xp });
+    }
+    await engine.start('wraith', 'standard', 'XP-DROP-CAP', 'infinite');
+    engine.anomaly = null; engine.sector = 100; engine.enemies = []; engine.random.next = () => 1;
+    engine.spawnEnemy('drone', 400, 400, false);
+    return { states, infiniteCap: engine.enemies[0].xp };
+  });
+  expect(drops.states[0]!.scale).toBe(1);
+  expect(drops.states[1]!.scale).toBeCloseTo(1.735, 6);
+  expect(drops.states[2]!.scale).toBeCloseTo(2.485, 6);
+  expect(drops.states[0]!.xp).toBeCloseTo(7, 6);
+  expect(drops.states[1]!.xp).toBeCloseTo(7 * 1.735, 6);
+  expect(drops.states[2]!.xp).toBeCloseTo(7 * 2.485, 6);
+  expect(drops.infiniteCap).toBeCloseTo(17.5, 6);
+});
+
+test('persistent upgrades spend their own XP costs and refund downgrades or a full reset', async ({ page }) => {
+  const result = await page.evaluate(async () => {
+    const modulePath = '/src/game/campaign.ts';
+    const campaign = await import(/* @vite-ignore */ modulePath);
+    localStorage.setItem(campaign.CAMPAIGN_XP_KEY, '0');
+    localStorage.setItem(campaign.CAMPAIGN_LOADOUT_KEY, '{}');
+    const noFunds = campaign.purchaseInitialBonus('damage');
+    localStorage.setItem(campaign.CAMPAIGN_XP_KEY, '500');
+    const purchases = [
+      campaign.purchaseInitialBonus('damage'),
+      campaign.purchaseInitialBonus('damage'),
+      campaign.purchaseInitialBonus('fireRate'),
+      campaign.purchaseInitialBonus('vitality'),
+    ];
+    const afterPurchases = {
+      xp: campaign.readCampaignXp(), loadout: campaign.readInitialBonuses(),
+      invested: campaign.getBonusInvestedXp(campaign.readInitialBonuses()),
+    };
+    const insufficient = campaign.purchaseInitialBonus('damage');
+    const refund = campaign.refundInitialBonus('damage');
+    const afterRefund = {
+      xp: campaign.readCampaignXp(), loadout: campaign.readInitialBonuses(),
+      invested: campaign.getBonusInvestedXp(campaign.readInitialBonuses()),
+    };
+    const reset = campaign.resetInitialBonuses();
+    return { noFunds, purchases, afterPurchases, insufficient, refund, afterRefund, reset };
+  });
+  expect(result.noFunds).toMatchObject({ changed: false, cost: 100, xp: 0 });
+  expect(result.purchases.map((purchase: any) => [purchase.changed, purchase.cost])).toEqual([[true, 100], [true, 138], [true, 110], [true, 120]]);
+  expect(result.afterPurchases).toEqual({ xp: 32, loadout: { damage: 2, fireRate: 1, vitality: 1 }, invested: 468 });
+  expect(result.insufficient).toMatchObject({ changed: false, cost: 212, xp: 32 });
+  expect(result.refund).toMatchObject({ changed: true, refund: 138, xp: 170 });
+  expect(result.afterRefund).toEqual({ xp: 170, loadout: { damage: 1, fireRate: 1, vitality: 1 }, invested: 330 });
+  expect(result.reset).toMatchObject({ changed: true, refund: 330, xp: 500, loadout: {} });
+});
+
 test('boss death stops spawning but requires every remaining enemy before clear and EXP', async ({ page }) => {
   const errors: string[] = [];
   page.on('pageerror', error => errors.push(error.message));
+  await page.evaluate(() => localStorage.setItem('echo-abyss-unlocked-level', '5'));
+  await page.reload();
   await page.getByRole('button', { name: 'LEVEL', exact: true }).click();
   await expect(page.locator('.level-setup')).toBeVisible();
-  await expect(page.getByRole('button', { name: 'レベル2 加速 ロック中' })).toBeDisabled();
+  await expect(page.getByRole('button', { name: /レベル6 .* ロック中/ })).toBeDisabled();
+  await page.getByRole('button', { name: 'レベル5 深淵', exact: true }).click();
+  await expect(page.locator('.stage-parameters')).toContainText(`BOSS // ${BOSS_DEFINITIONS.warden.name}`);
   await page.screenshot({ path: 'test-results/level-menu.png' });
-  await page.getByRole('button', { name: /レベル001を開始/ }).click();
+  await page.getByRole('button', { name: /レベル005を開始/ }).click();
   await expect.poll(async () => (await snapshot(page)).gameMode).toBe('level');
   await page.evaluate(() => {
     const engine = (window as any).__ECHO__;
@@ -587,26 +906,29 @@ test('boss death stops spawning but requires every remaining enemy before clear 
     target.hp = 1; engine.damageEnemy(target, 10, 'player');
   });
   await expect(page.getByRole('heading', { name: 'LEVEL CLEAR' })).toBeVisible();
-  await expect(page.locator('.xp-reward')).toContainText('+130');
-  expect(await page.evaluate(() => localStorage.getItem('echo-abyss-campaign-xp'))).toBe('130');
-  expect(await page.evaluate(() => localStorage.getItem('echo-abyss-unlocked-level'))).toBe('2');
+  await expect(page.locator('.xp-reward')).toContainText('+185');
+  expect(await page.evaluate(() => localStorage.getItem('echo-abyss-campaign-xp'))).toBe('185');
+  expect(await page.evaluate(() => localStorage.getItem('echo-abyss-unlocked-level'))).toBe('6');
   await page.screenshot({ path: 'test-results/level-clear.png' });
   await page.getByRole('button', { name: /次のレベルを準備/ }).click();
   await expect(page.getByRole('dialog', { name: '初期ボーナス編成' })).toBeVisible();
-  await expect(page.locator('.bonus-account')).toContainText('130');
-  await expect(page.locator('.bonus-account')).toContainText('/ 2 PT');
-  await expect(page.locator('.launch-button')).toContainText('レベル002を開始');
+  await expect(page.locator('.bonus-account')).toContainText('185');
+  await expect(page.locator('.bonus-account')).toContainText('AVAILABLE EXP');
+  await expect(page.locator('.bonus-account > div').nth(2)).toContainText('0 / 120 LV');
+  await expect(page.locator('.bonus-panel')).not.toContainText('AVAILABLE POINTS');
+  await expect(page.locator('.launch-button')).toContainText('レベル006を開始');
   await page.evaluate(async () => {
     const engine = (window as any).__ECHO__;
-    await engine.start('wraith', 'standard', 'REPEAT-CLEAR', 'level', 1);
+    await engine.start('wraith', 'standard', 'REPEAT-CLEAR', 'level', 5);
     engine.enemies = []; engine.bossSpawned = true; engine.spawnBoss();
     const boss = engine.enemies.find((enemy: any) => enemy.kind === 'boss');
     boss.hp = 1; engine.damageEnemy(boss, 10, 'player');
   });
   await expect(page.getByRole('heading', { name: 'LEVEL CLEAR' })).toBeVisible();
-  await expect(page.locator('.xp-reward')).toContainText('+46');
-  await expect(page.locator('.xp-reward')).toContainText('176 XP / 3 PT');
-  expect(await page.evaluate(() => localStorage.getItem('echo-abyss-campaign-xp'))).toBe('176');
+  await expect(page.locator('.xp-reward')).toContainText('+65');
+  await expect(page.locator('.xp-reward')).toContainText('250 XP');
+  await expect(page.locator('.xp-reward')).not.toContainText('PT');
+  expect(await page.evaluate(() => localStorage.getItem('echo-abyss-campaign-xp'))).toBe('250');
   expect(errors).toEqual([]);
 });
 
@@ -810,8 +1132,12 @@ test('WRAITH rail keeps its impact and adds three sustained damage ticks over on
     engine.player.angle = 0;
     engine.pointer.inside = false;
     engine.random.next = () => 0.99;
-    engine.spawnEnemy('tank', engine.player.x + 150, engine.player.y, false);
+    // Bosses are the only targets that survive the opening hit, so they are
+    // the ones that can measure the sustained beam ticks.
+    engine.bossSpawned = true;
+    engine.spawnBoss();
     const target = engine.enemies[0];
+    target.x = engine.player.x + 150; target.y = engine.player.y;
     const initialHp = target.hp;
     engine.useWeaponSkill();
     const afterImpact = target.hp;
@@ -827,6 +1153,7 @@ test('WRAITH rail keeps its impact and adds three sustained damage ticks over on
       tickDamage: beam.tickDamage, duration: beam.maxLife, lifeAfter: beam.life,
     };
   });
+  // Bosses take the original single-target rail damage, not the sweep bonus.
   expect(result.afterImpact).toBeCloseTo(result.initialHp - result.damage * 6, 6);
   expect(result.tickDamage).toBeCloseTo(result.damage * 0.75, 6);
   expect(result.duration).toBe(1);
@@ -835,6 +1162,78 @@ test('WRAITH rail keeps its impact and adds three sustained damage ticks over on
   expect(result.samples[3]).toBeCloseTo(result.afterImpact - result.tickDamage * 3, 6);
   expect(result.samples[4]).toBeCloseTo(result.samples[3], 6);
   expect(result.lifeAfter).toBeLessThanOrEqual(0);
+});
+
+test('WRAITH rail aims at the densest hostile cluster and erases normal enemies in one cast', async ({ page }) => {
+  const result = await page.evaluate(async () => {
+    const engine = (window as any).__ECHO__;
+    const setup = async (seed: string) => {
+      await engine.start('wraith', 'standard', seed, 'level', 40);
+      engine.tutorialEnabled = false;
+      engine.enemies = [];
+      engine.projectiles = [];
+      engine.beams = [];
+      engine.player.fireTimer = 999;
+      engine.player.weaponCooldown = 0;
+      engine.player.angle = 0;
+      engine.pointer.inside = false;
+      engine.railAim = null;
+      engine.elapsed = 0;
+      engine.random.next = () => 0.99;
+      engine.spawnTimer = 999;
+      engine.bossSpawned = true;
+    };
+    const place = (kind: string, x: number, y: number) => {
+      engine.spawnEnemy(kind, x, y, false);
+      const enemy = engine.enemies[engine.enemies.length - 1];
+      enemy.elite = false; enemy.hp = enemy.maxHp;
+      return enemy;
+    };
+
+    // Crowd on the left, a lone straggler on the right. The beam must sweep
+    // the crowd even though the pointer sits on the right.
+    await setup('RAIL-AIM-LEFT');
+    const px = engine.player.x, py = engine.player.y;
+    const left = [
+      place('drone', px - 210, py - 40), place('drone', px - 250, py + 30),
+      place('drone', px - 180, py + 10), place('gunner', px - 320, py - 60),
+      place('dart', px - 300, py + 70),
+    ];
+    const right = place('drone', px + 260, py + 5);
+    engine.pointer = { x: px + 500, y: py, inside: true };
+    engine.useWeaponSkill();
+    const beam = engine.beams.find((candidate: any) => candidate.kind === 'rail');
+    const at = beam.points[1];
+    const aimedLeft = at.x < px;
+    const crowdCleared = left.every(enemy => enemy.dead);
+    const stragglerCleared = right.dead;
+    const crowdDead = left.filter(enemy => enemy.dead).length;
+
+    // Pointing the pointer at an empty corner must not drag the lane off the
+    // crowd either.
+    await setup('RAIL-AIM-CORNER');
+    for (let i = 0; i < 6; i++) place('drone', px + 120 + i * 34, py - 180 - i * 12);
+    engine.pointer = { x: px - 600, y: py + 500, inside: true };
+    engine.useWeaponSkill();
+    const upBeam = engine.beams.find((candidate: any) => candidate.kind === 'rail');
+    const aimedUpRight = upBeam.points[1].y < py && upBeam.points[1].x > px;
+
+    // A HUD-driven press without any pointer input still picks the crowd.
+    await setup('RAIL-AIM-NO-POINTER');
+    engine.pointer = { x: 0, y: 0, inside: false };
+    for (let i = 0; i < 5; i++) place('drone', px - 140, py + 200 + i * 30);
+    engine.useWeaponSkill();
+    const noPointerBeam = engine.beams.find((candidate: any) => candidate.kind === 'rail');
+    const aimedDownLeft = noPointerBeam.points[1].y > py && noPointerBeam.points[1].x < px;
+
+    return { aimedLeft, crowdCleared, stragglerCleared, crowdDead, aimedUpRight, aimedDownLeft };
+  });
+  expect(result.aimedLeft).toBe(true);
+  expect(result.crowdDead).toBe(5);
+  expect(result.crowdCleared).toBe(true);
+  expect(result.stragglerCleared).toBe(false);
+  expect(result.aimedUpRight).toBe(true);
+  expect(result.aimedDownLeft).toBe(true);
 });
 
 test('normal enemies gain extra durability after round 30 without changing boss or attack scaling', async ({ page }) => {
@@ -940,11 +1339,20 @@ test('percentage loadout is editable and run drafts reset between stages', async
   await page.reload();
   await page.getByRole('button', { name: 'LEVEL', exact: true }).click();
   await page.getByRole('button', { name: '初期ボーナスを編集' }).click();
-  await expect(page.locator('.bonus-account')).toContainText('/ 16 PT');
+  await expect(page.locator('.bonus-account > div').nth(0)).toContainText('5,000');
+  await expect(page.locator('.bonus-account > div').nth(1)).toContainText('630');
+  await expect(page.locator('.bonus-account > div').nth(2)).toContainText('5 / 120 LV');
+  await expect(page.locator('.bonus-panel')).not.toContainText('AVAILABLE POINTS');
   const damageCard = page.locator('.bonus-card').filter({ hasText: '武器出力' });
   await expect(damageCard).toContainText('合計 +17%');
+  await expect(damageCard).toContainText('NEXT LV.3');
+  await expect(damageCard).toContainText('212 XP');
   await damageCard.getByRole('button', { name: '武器出力を強化' }).click();
   await expect(damageCard).toContainText('合計 +26%');
+  await expect(damageCard).toContainText('NEXT LV.4');
+  await expect(damageCard).toContainText('322 XP');
+  await expect(page.locator('.bonus-account > div').nth(0)).toContainText('4,788');
+  expect(await page.evaluate(() => localStorage.getItem('echo-abyss-campaign-xp'))).toBe('4788');
   await page.screenshot({ path: 'test-results/bonus-editor.png' });
   await page.getByRole('button', { name: 'この編成で閉じる' }).click();
   await page.getByRole('button', { name: /レベル001を開始/ }).click();
@@ -957,10 +1365,10 @@ test('percentage loadout is editable and run drafts reset between stages', async
     };
   });
   expect(initial.ranks).toBe(6);
-  expect(initial.damage).toBeCloseTo(18.63 * Math.pow(1.08, 3), 6);
-  expect(initial.fireRate).toBeCloseTo(3.6 * 0.95 * 1.06, 6);
-  expect(initial.maxHp).toBe(115);
-  expect(initial.hp).toBe(115);
+  expect(initial.damage).toBeCloseTo(18.216 * Math.pow(1.08, 3), 6);
+  expect(initial.fireRate).toBeCloseTo(3.6 * 0.92 * 1.06, 6);
+  expect(initial.maxHp).toBe(109);
+  expect(initial.hp).toBe(109);
   expect(initial.stacks).toBe(0);
   await page.evaluate(() => { const engine = (window as any).__ECHO__; engine.player.xp = engine.player.xpNext; });
   await expect.poll(async () => (await snapshot(page)).status).toBe('draft');
@@ -973,7 +1381,7 @@ test('percentage loadout is editable and run drafts reset between stages', async
   });
   expect(reset.level).toBe(1);
   expect(reset.stacks).toBe(0);
-  expect(reset.damage).toBeCloseTo(18.63 * Math.pow(1.08, 3), 6);
+  expect(reset.damage).toBeCloseTo(18.216 * Math.pow(1.08, 3), 6);
   expect(reset.ranks).toBe(6);
   expect(reset.stage).toBe(2);
 });
@@ -981,7 +1389,7 @@ test('percentage loadout is editable and run drafts reset between stages', async
 test('100-stage navigation reaches the final scaling and fourth warden phase', async ({ page }) => {
   await page.evaluate(() => {
     localStorage.setItem('echo-abyss-unlocked-level', '100');
-    localStorage.setItem('echo-abyss-campaign-xp', '259200');
+    localStorage.setItem('echo-abyss-campaign-xp', '0');
     localStorage.setItem('echo-abyss-initial-bonuses', JSON.stringify({ damage: 20, fireRate: 20, vitality: 20, echoDamage: 20, mobility: 20, xpGain: 20 }));
   });
   await page.reload();
@@ -1008,31 +1416,44 @@ test('100-stage navigation reaches the final scaling and fourth warden phase', a
   await expect.poll(() => page.evaluate(() => (window as any).__ECHO__.enemies.find((enemy: any) => enemy.kind === 'boss').phase)).toBe(4);
 });
 
-test('persistent bonuses obey earned points and compound to the rank cap', async ({ page }) => {
+test('persistent bonuses only equip purchased ranks and compound to the rank cap', async ({ page }) => {
   const locked = await page.evaluate(async () => {
     localStorage.setItem('echo-abyss-campaign-xp', '0');
+    localStorage.setItem('echo-abyss-initial-bonuses', '{}');
     const engine = (window as any).__ECHO__;
     await engine.start('wraith', 'standard', 'NO-FREE-BONUS', 'level', 50, { damage: 20 });
     return { damage: engine.player.stats.damage, ranks: engine.initialBonusRanks };
   });
-  expect(locked).toEqual({ damage: 18.63, ranks: 0 });
+  expect(locked).toEqual({ damage: 18.216, ranks: 0 });
   const earned = await page.evaluate(async () => {
-    localStorage.setItem('echo-abyss-campaign-xp', '162');
+    const modulePath = '/src/game/campaign.ts';
+    const campaign = await import(/* @vite-ignore */ modulePath);
+    localStorage.setItem(campaign.CAMPAIGN_XP_KEY, '500');
+    localStorage.setItem(campaign.CAMPAIGN_LOADOUT_KEY, '{}');
+    campaign.purchaseInitialBonus('damage');
+    campaign.purchaseInitialBonus('damage');
+    campaign.purchaseInitialBonus('damage');
     const engine = (window as any).__ECHO__;
     await engine.start('wraith', 'standard', 'EARNED-BONUS', 'level', 50, { damage: 20 });
-    return { damage: engine.player.stats.damage, ranks: engine.initialBonusRanks };
+    return {
+      damage: engine.player.stats.damage, ranks: engine.initialBonusRanks,
+      available: campaign.readCampaignXp(), invested: campaign.getBonusInvestedXp(campaign.readInitialBonuses()),
+    };
   });
   expect(earned.ranks).toBe(3);
-  expect(earned.damage).toBeCloseTo(18.63 * Math.pow(1.08, 3), 6);
+  expect(earned.damage).toBeCloseTo(18.216 * Math.pow(1.08, 3), 6);
+  expect(earned.available).toBe(50);
+  expect(earned.invested).toBe(450);
   const capped = await page.evaluate(async () => {
-    localStorage.setItem('echo-abyss-campaign-xp', '259200');
+    localStorage.setItem('echo-abyss-campaign-xp', '0');
+    localStorage.setItem('echo-abyss-initial-bonuses', JSON.stringify({ damage: 20, fireRate: 20, vitality: 20, echoDamage: 20, mobility: 20, xpGain: 20 }));
     const engine = (window as any).__ECHO__;
     await engine.start('wraith', 'standard', 'CAP-BONUS', 'level', 100, { damage: 99, fireRate: 99, vitality: 99, echoDamage: 99, mobility: 99, xpGain: 99 });
     return { damage: engine.player.stats.damage, maxHp: engine.player.stats.maxHp, ranks: engine.initialBonusRanks, bonuses: engine.activeBonuses };
   });
   expect(capped.ranks).toBe(120);
-  expect(capped.damage).toBeCloseTo(18.63 * Math.pow(1.08, 20), 6);
-  expect(capped.maxHp).toBe(639);
+  expect(capped.damage).toBeCloseTo(18.216 * Math.pow(1.08, 20), 6);
+  expect(capped.maxHp).toBe(605);
   expect(Object.values(capped.bonuses).every(rank => rank === 20)).toBe(true);
 });
 
@@ -1048,6 +1469,10 @@ test.describe('touch layout', () => {
     await page.getByRole('button', { name: '初期ボーナスを編集' }).tap();
     await expect(page.getByRole('dialog', { name: '初期ボーナス編成' })).toBeVisible();
     await expect(page.locator('.bonus-card')).toHaveCount(6);
+    const damageCard = page.locator('.bonus-card').filter({ hasText: '武器出力' });
+    await expect(damageCard).toContainText('NEXT LV.1');
+    await expect(damageCard).toContainText('100 XP');
+    await expect(damageCard.getByRole('button', { name: '武器出力を強化' })).toBeDisabled();
     expect(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 1)).toBe(false);
     await page.screenshot({ path: 'test-results/mobile-bonus-editor.png' });
   });

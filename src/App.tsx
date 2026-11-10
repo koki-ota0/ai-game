@@ -9,11 +9,12 @@ import {
   Trophy, Volume2, VolumeX, Wind, X, Zap,
 } from 'lucide-react';
 import { GameEngine, INFINITE_CHECKPOINT_INTERVAL, INFINITE_MAX_SECTOR, WEAPON_SKILLS, createSeed } from './game/GameEngine';
+import { BOSS_DEFINITIONS } from './game/bosses';
 import { CORES } from './game/types';
 import { LEVELS, formatStage } from './game/levels';
 import {
-  INITIAL_BONUSES, MAX_BONUS_POINTS, countBonusRanks, getBonusPoints,
-  getNextBonusPointXp, readCampaignXp, readInitialBonuses, saveInitialBonuses,
+  INITIAL_BONUSES, TOTAL_BONUS_RANKS, countBonusRanks, getBonusInvestedXp, getBonusUpgradeCost,
+  purchaseInitialBonus, readCampaignXp, readInitialBonuses, refundInitialBonus, resetInitialBonuses,
 } from './game/campaign';
 import type { BonusLoadout, InitialBonusId } from './game/campaign';
 import type {
@@ -43,7 +44,7 @@ const PILOT_STEPS = [
   { title: '狙って、撃て', detail: 'マウス左・画面を長押しして照準＋射撃' },
   { title: '危険をすり抜けろ', detail: 'SPACE / DASH で無敵ダッシュ' },
   { title: '過去の自分を呼べ', detail: 'E / ECHO で数秒前の自分を召喚' },
-  { title: 'フレーム技能を解放', detail: 'R / SKILL で強力な武器スキル' },
+  { title: 'フレーム技能を解放', detail: 'Q / SKILL で強力な武器スキル' },
 ];
 
 function UpgradeIcon({ icon }: { icon: string }) {
@@ -98,7 +99,7 @@ function App() {
     setUnlockedLevel(Math.max(1, Math.min(LEVELS.length, Number(localStorage.getItem('echo-abyss-unlocked-level') ?? 1))));
     const xp = readCampaignXp();
     setCampaignXp(xp);
-    setBonusLoadout(readInitialBonuses(xp));
+    setBonusLoadout(readInitialBonuses());
   };
 
   useEffect(() => {
@@ -190,20 +191,20 @@ function App() {
   };
 
   const changeBonus = (id: InitialBonusId, delta: number) => {
-    const definition = INITIAL_BONUSES.find(bonus => bonus.id === id)!;
-    const currentRank = bonusLoadout[id] ?? 0;
-    const nextRank = Math.max(0, Math.min(definition.maxRank, currentRank + delta));
-    if (nextRank === currentRank) return;
-    if (delta > 0 && countBonusRanks(bonusLoadout) >= getBonusPoints(campaignXp)) return;
-    const next = { ...bonusLoadout, [id]: nextRank };
-    setBonusLoadout(saveInitialBonuses(next, campaignXp));
+    const transaction = delta > 0 ? purchaseInitialBonus(id) : refundInitialBonus(id);
+    if (!transaction.changed) return;
+    setCampaignXp(transaction.xp);
+    setBonusLoadout(transaction.loadout);
   };
 
-  const resetBonuses = () => setBonusLoadout(saveInitialBonuses({}, campaignXp));
+  const resetBonuses = () => {
+    const transaction = resetInitialBonuses();
+    setCampaignXp(transaction.xp);
+    setBonusLoadout(transaction.loadout);
+  };
   const selectedChallenge = LEVELS[selectedLevel - 1]!;
   const visibleLevels = LEVELS.slice(levelChapter * 10, levelChapter * 10 + 10);
-  const bonusPoints = getBonusPoints(campaignXp);
-  const usedBonusPoints = countBonusRanks(bonusLoadout);
+  const usedBonusRanks = countBonusRanks(bonusLoadout);
   const activeBonusNames = INITIAL_BONUSES.filter(bonus => (bonusLoadout[bonus.id] ?? 0) > 0).map(bonus => `${bonus.name} LV.${bonusLoadout[bonus.id]}`);
   const initialBuildSummary = activeBonusNames.length
     ? `${activeBonusNames.slice(0, 2).join(' / ')}${activeBonusNames.length > 2 ? ` ほか${activeBonusNames.length - 2}` : ''}`
@@ -300,8 +301,8 @@ function App() {
                 <div className="level-setup">
                   <div className="level-setup-heading"><span>CAMPAIGN // 100 STAGES</span><small>{formatStage(unlockedLevel)} / 100 UNLOCKED</small></div>
                   <button className="campaign-loadout" onClick={() => setBonusEditor(true)} aria-label="初期ボーナスを編集">
-                    <span><small>CAMPAIGN EXP</small><strong>{number(campaignXp)} <em>XP</em></strong></span>
-                    <span><small>INITIAL BONUS</small><strong>{usedBonusPoints} <em>/ {bonusPoints} PT</em></strong></span>
+                    <span><small>AVAILABLE EXP</small><strong>{number(campaignXp)} <em>XP</em></strong></span>
+                    <span><small>UPGRADE RANKS</small><strong>{usedBonusRanks} <em>/ {TOTAL_BONUS_RANKS} LV</em></strong></span>
                     <span className="campaign-loadout-edit"><SlidersHorizontal size={14} /> 編集</span>
                   </button>
                   <div className="chapter-selector">
@@ -313,8 +314,8 @@ function App() {
                     {visibleLevels.map(level => {
                       const locked = level.id > unlockedLevel;
                       return (
-                        <button key={level.id} disabled={locked} className={selectedLevel === level.id ? 'selected' : ''} onClick={() => setSelectedLevel(level.id)} aria-label={`レベル${level.id} ${level.name}${locked ? ' ロック中' : ''}`}>
-                          <strong>{formatStage(level.id)}</strong><small>{level.name}</small>{locked ? <Lock size={9} /> : level.id < unlockedLevel ? <Check size={9} /> : null}
+                        <button key={level.id} disabled={locked} className={`${selectedLevel === level.id ? 'selected' : ''} ${level.hasBoss ? 'boss-stage' : ''}`} onClick={() => setSelectedLevel(level.id)} aria-label={`レベル${level.id} ${level.name}${locked ? ' ロック中' : ''}`}>
+                          <strong>{formatStage(level.id)}</strong><small>{level.hasBoss ? `${level.name}・BOSS` : level.name}</small>{locked ? <Lock size={9} /> : level.id < unlockedLevel ? <Check size={9} /> : null}
                         </button>
                       );
                     })}
@@ -322,8 +323,13 @@ function App() {
                   <div className="level-brief">
                     <div><strong>{selectedChallenge.sectorName} / {selectedChallenge.name}<small>LEVEL {formatStage(selectedChallenge.id)} // {selectedChallenge.enName}</small></strong><b>敵HP ×{selectedChallenge.enemyHealth.toFixed(2)}</b></div>
                     <p>{selectedChallenge.briefing}</p>
-                    <div className="stage-parameters"><span>WARDEN 0{selectedChallenge.bossTier}</span><span>戦闘 {selectedChallenge.combatDuration}s</span><span>FIRST +{selectedChallenge.xpReward} XP</span></div>
-                    <div className="initial-build" title={activeBonusNames.join(' / ')}><Layers3 size={13} /><span><small>INITIAL BONUS // {usedBonusPoints} PT</small>{initialBuildSummary}</span></div>
+                    <div className="stage-parameters">
+                      {selectedChallenge.hasBoss
+                        ? <span title={BOSS_DEFINITIONS[selectedChallenge.bossKind].description}>BOSS // {BOSS_DEFINITIONS[selectedChallenge.bossKind].name}</span>
+                        : <span>NORMAL // 時間終了後に掃討</span>}
+                      <span>戦闘 {selectedChallenge.combatDuration}s</span><span>FIRST +{selectedChallenge.xpReward} XP</span>
+                    </div>
+                    <div className="initial-build" title={activeBonusNames.join(' / ')}><Layers3 size={13} /><span><small>INITIAL BONUS // TOTAL LV.{usedBonusRanks}</small>{initialBuildSummary}</span></div>
                   </div>
                 </div>
               )}
@@ -333,7 +339,7 @@ function App() {
                 <span><small>{gameMode === 'level' ? `INITIALIZE LEVEL ${formatStage(selectedLevel)}` : 'INITIALIZE TIMELINE'}</small><strong>{gameMode === 'level' ? `レベル${formatStage(selectedLevel)}を開始` : '潜行を開始'}</strong></span>
                 <ArrowRight size={22} />
               </button>
-              <p className="launch-note"><span /> {gameMode === 'level' ? `初期ボーナス ${usedBonusPoints}Pt。ワーデン＋残敵の全滅でクリア。` : difficulty === 'abyss' ? `ABYSS：敵HP ×1.55・ワーデンHP ×2・高密度。${INFINITE_CHECKPOINT_INTERVAL}セクターごとに継続／終了を選択。` : `${INFINITE_CHECKPOINT_INTERVAL}セクターごとに継続／終了を選択。最大${INFINITE_MAX_SECTOR}セクター。`}</p>
+              <p className="launch-note"><span /> {gameMode === 'level' ? `永続強化 総合LV.${usedBonusRanks}。${selectedChallenge.hasBoss ? 'ボス＋残敵の全滅でクリア。' : '規定時間後に出現停止。残敵全滅でクリア。'}` : difficulty === 'abyss' ? `ABYSS：敵HP ×1.55・ワーデンHP ×2・高密度。${INFINITE_CHECKPOINT_INTERVAL}セクターごとに継続／終了を選択。` : `${INFINITE_CHECKPOINT_INTERVAL}セクターごとに継続／終了を選択。最大${INFINITE_MAX_SECTOR}セクター。`}</p>
             </div>
           </div>
 
@@ -342,9 +348,9 @@ function App() {
               <span><kbd>WASD</kbd> 移動</span>
               <span><kbd>MOUSE</kbd> 照準・射撃</span>
               <span><kbd>SPACE</kbd> ダッシュ</span>
-              <span><kbd>R</kbd> 武器スキル</span>
+              <span><kbd>Q</kbd> 武器スキル</span>
               <span><kbd>E</kbd> 残響召喚</span>
-              <span><kbd>Q</kbd> ZERO FIELD</span>
+              <span><kbd>R</kbd> ZERO FIELD</span>
             </div>
             <span className="footer-status"><i /> SYSTEM NOMINAL</span>
           </footer>
@@ -363,9 +369,9 @@ function App() {
               </div>
             </div>
 
-            <div className={`timeline-panel ${hud.challengeCleanup ? 'is-cleanup' : ''}`} title={hud.gameMode === 'level' ? `LEVEL ${formatStage(hud.challengeLevel)}: ワーデンと残敵を全滅させてクリア` : hud.anomaly?.description ?? '安定した時間領域'}>
+            <div className={`timeline-panel ${hud.challengeCleanup ? 'is-cleanup' : ''}`} title={hud.gameMode === 'level' ? `LEVEL ${formatStage(hud.challengeLevel)}: ${hud.challengeHasBoss ? 'ボスと残敵を全滅させてクリア' : '時間終了後に残敵を全滅させてクリア'}` : hud.anomaly?.description ?? '安定した時間領域'}>
               <small>{hud.gameMode === 'level' ? 'CAMPAIGN STAGE' : 'T I M E L I N E'}</small>
-              <div><strong>{hud.gameMode === 'level' ? formatStage(hud.challengeLevel) : String(hud.sector).padStart(2, '0')}</strong><span><b>{time(hud.elapsed)}</b><small>{hud.boss ? 'WARDEN ENGAGED' : hud.challengeCleanup ? `残敵 ${hud.remainingEnemies} // 全滅でクリア` : hud.gameMode === 'level' ? hud.challengeName : hud.anomaly?.name ?? 'STABLE TIMELINE'}</small></span></div>
+              <div><strong>{hud.gameMode === 'level' ? formatStage(hud.challengeLevel) : String(hud.sector).padStart(2, '0')}</strong><span><b>{time(hud.elapsed)}</b><small>{hud.boss ? 'BOSS ENGAGED' : hud.challengeCleanup ? `残敵 ${hud.remainingEnemies} // 全滅でクリア` : hud.gameMode === 'level' ? hud.challengeName : hud.anomaly?.name ?? 'STABLE TIMELINE'}</small></span></div>
               <div className="timeline-track"><i style={{ width: `${Math.min(100, hud.sectorProgress * 100)}%` }} /></div>
             </div>
 
@@ -378,13 +384,13 @@ function App() {
 
           {hud.boss && (
             <div className="boss-hud">
-              <div><span><Radio size={13} /> ABYSSAL ENTITY</span><strong>{hud.boss.name}</strong><small>PHASE 0{hud.boss.phase}</small></div>
-              <div className="boss-track"><i style={{ width: `${hud.boss.hp / hud.boss.maxHp * 100}%` }} /></div>
+              <div><span style={{ color: hud.boss.color }}><Radio size={13} /> ABYSSAL ENTITY</span><strong>{hud.boss.name}</strong><small>PHASE 0{hud.boss.phase}</small></div>
+              <div className="boss-track"><i style={{ width: `${hud.boss.hp / hud.boss.maxHp * 100}%`, background: hud.boss.color, boxShadow: `0 0 10px ${hud.boss.color}55` }} /></div>
             </div>
           )}
 
           {hud.challengeCleanup && (
-            <div className="cleanup-objective"><Check size={17} /><span><small>WARDEN ERASED</small><strong>残敵を全滅</strong></span><b>{String(hud.remainingEnemies).padStart(2, '0')}</b></div>
+            <div className="cleanup-objective"><Check size={17} /><span><small>{hud.challengeHasBoss ? 'BOSS ERASED' : 'COMBAT WINDOW SEALED'}</small><strong>残敵を全滅</strong></span><b>{String(hud.remainingEnemies).padStart(2, '0')}</b></div>
           )}
 
           {hud.rift && (
@@ -428,7 +434,7 @@ function App() {
               cooldown={hud.dashCooldown} onClick={() => engineRef.current?.triggerDash()}
             />
             <Ability
-              icon={<CoreIcon core={hud.core} size={21} />} label={hud.weaponSkillName} hotkey="R"
+              icon={<CoreIcon core={hud.core} size={21} />} label={hud.weaponSkillName} hotkey="Q"
               description={hud.weaponSkillDescription}
               ready={hud.weaponCooldown <= 0} progress={1 - hud.weaponCooldown / hud.weaponMaxCooldown}
               cooldown={hud.weaponCooldown} onClick={() => engineRef.current?.triggerWeaponSkill()}
@@ -441,7 +447,7 @@ function App() {
               onClick={() => engineRef.current?.triggerEcho()} primary
             />
             <Ability
-              icon={<Zap size={22} />} label="ZERO FIELD" hotkey="Q"
+              icon={<Zap size={22} />} label="ZERO FIELD" hotkey="R"
               description="敵と弾幕を遅延し、攻撃速度を上げる究極能力"
               ready={hud.sync >= 100} progress={hud.overdrive > 0 ? 1 : hud.sync / 100}
               active={hud.overdrive > 0} cooldown={hud.overdrive}
@@ -450,9 +456,9 @@ function App() {
           </div>
           <div className="weapon-readout" style={{ '--weapon-color': CORES.find(core => core.id === hud.core)?.color } as React.CSSProperties}>
             <span className="weapon-readout-icon"><CoreIcon core={hud.core} size={20} /></span>
-            <span><small>WEAPON // {hud.weapon}</small><strong>{hud.weaponDetail}</strong><em><kbd>R</kbd>{hud.weaponSkillName}</em></span>
+            <span><small>WEAPON // {hud.weapon}</small><strong>{hud.weaponDetail}</strong><em><kbd>Q</kbd>{hud.weaponSkillName}</em></span>
           </div>
-          <div className="manual-fire-hint"><MousePointer2 size={14} /><span><b>LMB</b> FIRE · <b>RMB / R</b> SKILL</span></div>
+          <div className="manual-fire-hint"><MousePointer2 size={14} /><span><b>LMB</b> FIRE · <b>RMB / Q</b> SKILL</span></div>
           <div className="run-meta"><span>SEED // {hud.seed}</span><span>{hud.kills} HOSTILES ERASED</span></div>
           {hud.shield && <div className="shield-indicator"><ShieldCheck size={14} /> シールド展開中</div>}
         </section>
@@ -468,7 +474,7 @@ function App() {
               <div className="draft-symbol">{draft.reason === 'boss' ? <Trophy size={28} /> : <Sparkles size={28} />}</div>
               <small>{draft.reason === 'boss' ? 'ABYSSAL CORE ACQUIRED' : 'EVOLUTION AVAILABLE'}</small>
               <h2>{draft.reason === 'boss' ? '深淵のコアを接続' : '進化を選択'}</h2>
-              <p>{draft.reason === 'boss' ? 'ワーデンの残滓が、高純度の可能性を残した。' : 'タイムラインが分岐する。ひとつを選び、さらに深くへ。'}</p>
+              <p>{draft.reason === 'boss' ? 'ボスの残滓が、高純度の可能性を残した。' : 'タイムラインが分岐する。ひとつを選び、さらに深くへ。'}</p>
             </div>
             <div className="upgrade-grid">
               {draft.choices.map((upgrade, index) => {
@@ -550,7 +556,7 @@ function App() {
             </div>
             <div className="final-score"><small>FINAL SYNC SCORE</small><strong>{number(result.score)}</strong><span>{result.gameMode === 'level' ? `LEVEL ${formatStage(result.challengeLevel)} // ${LEVELS[result.challengeLevel - 1]?.name ?? ''}` : infiniteClear ? `TIMELINE ${String(result.sector).padStart(2, '0')} // COMPLETE` : `TIMELINE ${String(result.sector).padStart(2, '0')} に到達`}</span></div>
             {result.gameMode === 'level' && result.victory && (
-              <div className="xp-reward"><Trophy size={18} /><span><small>{result.firstClear ? 'FIRST CLEAR REWARD' : 'REPEAT CLEAR REWARD'}</small><strong>+{number(result.xpEarned)} <em>XP</em></strong></span><span><small>CAMPAIGN TOTAL</small><b>{number(result.totalXp)} XP / {result.bonusPoints} PT</b></span></div>
+              <div className="xp-reward"><Trophy size={18} /><span><small>{result.firstClear ? 'FIRST CLEAR REWARD' : 'REPEAT CLEAR REWARD'}</small><strong>+{number(result.xpEarned)} <em>XP</em></strong></span><span><small>AVAILABLE EXP</small><b>{number(result.totalXp)} XP</b></span></div>
             )}
             <div className="result-stats">
               <div><Clock3 size={17} /><small>{result.victory ? 'CLEAR TIME' : 'SURVIVAL'}</small><strong>{time(result.elapsed)}</strong></div>
@@ -618,29 +624,26 @@ function BonusEditor({ xp, loadout, onChange, onReset, onClose }: {
   onReset: () => void;
   onClose: () => void;
 }) {
-  const points = getBonusPoints(xp);
   const used = countBonusRanks(loadout);
-  const available = points - used;
-  const nextPointXp = getNextBonusPointXp(xp);
-  const currentThreshold = 18 * points * points;
-  const progress = nextPointXp === null ? 1 : Math.max(0, Math.min(1, (xp - currentThreshold) / Math.max(1, nextPointXp - currentThreshold)));
+  const invested = getBonusInvestedXp(loadout);
   return (
     <section className="modal-layer bonus-layer" role="dialog" aria-modal="true" aria-label="初期ボーナス編成">
       <div className="bonus-panel glass-panel">
         <button className="close-button" onClick={onClose} aria-label="初期ボーナスを閉じる"><X size={20} /></button>
-        <small className="help-eyebrow">CAMPAIGN LOADOUT // PERSISTENT</small>
-        <h2>初期ボーナスを設計</h2>
-        <p className="bonus-intro">ステージクリアで貯まるEXPに応じてポイントが増加。割り振ってもEXPは消費せず、いつでも無料で編成できます。全て乗算％強化です。</p>
+        <small className="help-eyebrow">CAMPAIGN LOADOUT // EXP ALLOCATION</small>
+        <h2>EXPを割り振って強化</h2>
+        <p className="bonus-intro">クリアで得たEXPを消費し、各能力を個別に強化します。必要EXPは能力と現在LVで決まり、同じ能力ほど次LVのコストが上昇します。降格・リセットしたランクのEXPは全額戻ります。</p>
         <div className="bonus-account">
-          <div><small>CAMPAIGN EXP</small><strong>{number(xp)} <em>XP</em></strong></div>
-          <div><small>AVAILABLE POINTS</small><strong>{available} <em>/ {points} PT</em></strong></div>
-          <div><small>NEXT POINT</small><strong>{nextPointXp === null ? 'MAX' : `${number(Math.max(0, nextPointXp - xp))} XP`}</strong></div>
+          <div><small>AVAILABLE EXP</small><strong>{number(xp)} <em>XP</em></strong></div>
+          <div><small>INVESTED EXP</small><strong>{number(invested)} <em>XP</em></strong></div>
+          <div><small>UPGRADE RANKS</small><strong>{used} <em>/ {TOTAL_BONUS_RANKS} LV</em></strong></div>
         </div>
-        <div className="bonus-xp-track"><i style={{ width: `${progress * 100}%` }} /></div>
         <div className="bonus-grid">
           {INITIAL_BONUSES.map(bonus => {
             const rank = loadout[bonus.id] ?? 0;
             const effect = Math.round((Math.pow(1 + bonus.percent / 100, rank) - 1) * 100);
+            const cost = getBonusUpgradeCost(bonus.id, rank);
+            const refund = rank > 0 ? getBonusUpgradeCost(bonus.id, rank - 1)! : 0;
             return (
               <article className={`bonus-card ${rank > 0 ? 'active' : ''}`} key={bonus.id}>
                 <span className="bonus-card-icon"><UpgradeIcon icon={bonus.icon} /></span>
@@ -648,12 +651,15 @@ function BonusEditor({ xp, loadout, onChange, onReset, onClose }: {
                   <small>{bonus.enName}</small>
                   <h3>{bonus.name}<b>1R +{bonus.percent}%</b></h3>
                   <p>{bonus.description}</p>
-                  <span className="bonus-effect">{rank > 0 ? `現在 合計 +${effect}%` : '未装備'}<small>LV.{rank} / {bonus.maxRank}</small></span>
+                  <span className="bonus-effect">{rank > 0 ? `現在 合計 +${effect}%` : '未強化'}<small>LV.{rank} / {bonus.maxRank}</small></span>
+                  <span className={`bonus-next-cost ${cost !== null && xp >= cost ? 'affordable' : ''}`}>
+                    {cost === null ? 'MAX RANK' : `NEXT LV.${rank + 1}`}<b>{cost === null ? '—' : `${number(cost)} XP`}</b>
+                  </span>
                 </div>
                 <div className="bonus-stepper">
-                  <button disabled={rank <= 0} onClick={() => onChange(bonus.id, -1)} aria-label={`${bonus.name}を下げる`}><Minus size={15} /></button>
+                  <button disabled={rank <= 0} onClick={() => onChange(bonus.id, -1)} aria-label={`${bonus.name}を下げる`} title={rank > 0 ? `${number(refund)} XPを返却してLVを下げる` : undefined}><Minus size={15} /></button>
                   <strong>{String(rank).padStart(2, '0')}</strong>
-                  <button disabled={available <= 0 || rank >= bonus.maxRank} onClick={() => onChange(bonus.id, 1)} aria-label={`${bonus.name}を強化`}><Plus size={15} /></button>
+                  <button disabled={cost === null || xp < cost} onClick={() => onChange(bonus.id, 1)} aria-label={`${bonus.name}を強化`} title={cost === null ? '最大LV' : `${number(cost)} XPでLV.${rank + 1}へ強化`}><Plus size={15} /></button>
                 </div>
               </article>
             );
@@ -661,10 +667,10 @@ function BonusEditor({ xp, loadout, onChange, onReset, onClose }: {
         </div>
         <div className="bonus-footer">
           <button className="quiet-button" disabled={used === 0} onClick={onReset}><RotateCcw size={14} /> 全てリセット</button>
-          <span>ステージ内の進化・レベルは次回開始時にリセット</span>
+          <span>降格・リセットは投資EXPを返却 / ステージ内の進化は次回開始時にリセット</span>
           <button className="primary-button" onClick={onClose}><Check size={16} /> この編成で閉じる</button>
         </div>
-        {points >= MAX_BONUS_POINTS && <p className="bonus-max-note">初期ボーナスポイントは上限に達しています。</p>}
+        {used >= TOTAL_BONUS_RANKS && <p className="bonus-max-note">全ての永続強化が最大LVです。</p>}
       </div>
     </section>
   );
@@ -680,7 +686,10 @@ function HelpModal({ onClose }: { onClose: () => void }) {
     { name: 'タンク', role: '高耐久', description: '二重の大型六角形。低速だが耐久力が高い。', color: '#d66b89', icon: <Hexagon size={20} /> },
     { name: 'スナイパー', role: '長射程', description: '長い砲身。赤い照準線が固定されたら射線から離れる。', color: '#ff384f', icon: <ScanLine size={20} /> },
     { name: 'ウィーバー', role: '弾幕', description: '紫の星型。周囲へ6方向の回転弾幕を展開する。', color: '#c27bff', icon: <Sparkles size={20} /> },
-    { name: 'AION // WARDEN', role: 'ボス', description: '3タイムラインごとに出現。外周リングの収縮が攻撃予兆。', color: '#ff405f', icon: <Radio size={20} /> },
+    { name: BOSS_DEFINITIONS.warden.name, role: 'ボス・円形弾幕', description: '円形弾幕・扇状射撃・召喚を使う。外周リングの収縮が攻撃予兆。', color: BOSS_DEFINITIONS.warden.color, icon: <Radio size={20} /> },
+    { name: BOSS_DEFINITIONS.lancer.name, role: 'ボス・高速突進', description: '橙色の照準線をロックした後、貫通射撃と直線突進を放つ。', color: BOSS_DEFINITIONS.lancer.color, icon: <Crosshair size={20} /> },
+    { name: BOSS_DEFINITIONS.choir.name, role: 'ボス・螺旋弾幕', description: '二重螺旋弾幕と衛星射撃に加え、ウィーバーを召喚する。', color: BOSS_DEFINITIONS.choir.color, icon: <AudioWaveform size={20} /> },
+    { name: BOSS_DEFINITIONS.colossus.name, role: 'ボス・近距離衝撃波', description: '金色の予兆円が縮んだら衝撃波。圏外へ避けて重弾幕を裁く。', color: BOSS_DEFINITIONS.colossus.color, icon: <Hexagon size={20} /> },
   ];
   return (
     <section className="modal-layer help-layer" role="dialog" aria-modal="true" aria-label="遊び方">
@@ -694,14 +703,14 @@ function HelpModal({ onClose }: { onClose: () => void }) {
         </div>
         {tab === 'systems' ? (
           <>
-            <p className="help-intro">近敵へのオート射撃に加え、マウス長押しで自由に照準・射撃できます。敵の欠片で進化し、3タイムラインごとのワーデンを撃破してください。</p>
+            <p className="help-intro">近敵へのオート射撃に加え、マウス長押しで自由に照準・射撃できます。敵の欠片で進化し、3タイムラインごとのボスを撃破してください。</p>
             <div className="help-controls">
               <div><kbd>W A S D</kbd><span><strong>移動</strong><small>矢印キーでも操作可能。「YOU」が自機</small></span></div>
               <div><kbd>MOUSE</kbd><span><strong>照準・手動射撃</strong><small>左長押しで連射。左を押したまま右クリックでも技能発動</small></span></div>
               <div><kbd>SPACE</kbd><span><strong>位相ダッシュ</strong><small>発動中は無敵。すり抜けて回避</small></span></div>
-              <div><kbd>R</kbd><span><strong>武器スキル</strong><small>フレーム固有の強力な能動攻撃</small></span></div>
+              <div><kbd>Q</kbd><span><strong>武器スキル</strong><small>フレーム固有の強力な能動攻撃</small></span></div>
               <div><kbd>E</kbd><span><strong>残響召喚</strong><small>数秒前の移動と射撃をもう一度再生</small></span></div>
-              <div><kbd>Q</kbd><span><strong>ZERO FIELD</strong><small>共鳴で溜まる究極の時間遅延</small></span></div>
+              <div><kbd>R</kbd><span><strong>ZERO FIELD</strong><small>共鳴で溜まる究極の時間遅延</small></span></div>
             </div>
             <div className="help-systems">
               <article><span><Copy size={21} /></span><div><small>01 // ECHO</small><h3>過去の自分は、最高の相棒</h3><p>残響は過去の移動と射撃タイミングを再生し、弾の向きだけを現在の敵へ自動補正します。ダッシュで位置を変え、残響と別方向から攻撃しましょう。</p></div></article>
@@ -709,7 +718,7 @@ function HelpModal({ onClose }: { onClose: () => void }) {
               <article><span><Zap size={21} /></span><div><small>03 // ZERO FIELD</small><h3>危機を、反撃の時間に変える</h3><p>ゲージ100%で発動。敵と弾幕が遅くなり、攻撃速度が上昇。ダッシュ・武器スキル・残響も即座に再使用できます。</p></div></article>
             </div>
             <p className="elite-note"><span /> SYNC RIFT はタイムライン02以降に現れる任意目標。円内で累計4秒維持すると、ZERO +35・最大HPの15%回復・欠片を獲得。円の外に出ても進行は減りません。</p>
-            <p className="elite-note"><span /> LEVEL MODE は全100ステージ。ワーデンと残敵を全滅させるとクリアです。獲得した永続EXPで％初期ボーナスを自由に編成でき、ステージ内の進化は次回開始時にリセットされます。</p>
+            <p className="elite-note"><span /> LEVEL MODE は全100ステージ。ボスは5の倍数のステージに出現し、通常面は時間終了後の残敵掃討でクリアです。高ステージほど永続EXP報酬と敵の欠片EXPが増え、必要EXPも段階的に上昇します。</p>
           </>
         ) : (
           <div className="codex-content">
@@ -717,7 +726,7 @@ function HelpModal({ onClose }: { onClose: () => void }) {
               {CORES.map(core => (
                 <article key={core.id} style={{ '--guide-color': core.color } as React.CSSProperties}>
                   <span className="guide-icon"><CoreIcon core={core.id} size={23} /></span>
-                  <div><small>{core.weapon}</small><h3>{core.name}<b>{core.trait}</b></h3><p>{core.description}</p><p className="guide-skill"><kbd>R</kbd><span><b>{WEAPON_SKILLS[core.id].name}</b>{WEAPON_SKILLS[core.id].description}</span></p></div>
+                  <div><small>{core.weapon}</small><h3>{core.name}<b>{core.trait}</b></h3><p>{core.description}</p><p className="guide-skill"><kbd>Q</kbd><span><b>{WEAPON_SKILLS[core.id].name}</b>{WEAPON_SKILLS[core.id].description}</span></p></div>
                 </article>
               ))}
             </section>
