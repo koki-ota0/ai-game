@@ -1,10 +1,12 @@
 import { SoundSystem } from './audio';
 import { BASTION_COLOR, CORES, ECHO_COLOR } from './types';
 import { UPGRADES, UPGRADE_BY_ID } from './upgrades';
+import { BOSS_DEFINITIONS, bossKindForEncounter } from './bosses';
+import type { BossKind } from './bosses';
 import { LEVELS, LEVEL_STARTING_MODIFIER, formatStage } from './levels';
 import type { LevelDefinition } from './levels';
 import {
-  applyInitialBonuses, awardStageClear, countBonusRanks, getBonusPoints,
+  applyInitialBonuses, awardStageClear, countBonusRanks,
   readCampaignXp, readInitialBonuses, sanitizeBonusLoadout,
 } from './campaign';
 import type { BonusLoadout } from './campaign';
@@ -26,6 +28,13 @@ const INFINITE_DEPTH_SCALING = { health: 1.12, lateHealth: 1.18, bossHealth: 1.1
 const INFINITE_ROUND_SPAWN_PAUSE = 2.4;
 const ABYSS_MODIFIER = { health: 1.55, bossHealth: 2, spawnRate: 1.4, damage: 1.2, speed: 1.1, enemyCap: 1.2, elite: 0.07 } as const;
 
+// The requirement rises at every run level. Enemy shards use a separate,
+// bounded difficulty multiplier so later fights still support this curve.
+export function getRunXpRequirement(level: number) {
+  const completedLevels = Math.max(0, Math.floor(level) - 1);
+  return Math.floor(30 + completedLevels * 24 + Math.pow(completedLevels, 2) * 4);
+}
+
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
 const distance = (ax: number, ay: number, bx: number, by: number) => Math.hypot(ax - bx, ay - by);
@@ -37,6 +46,21 @@ const distanceToSegment = (px: number, py: number, ax: number, ay: number, bx: n
   return Math.hypot(px - (ax + dx * t), py - (ay + dy * t));
 };
 const formatSeed = () => Math.random().toString(36).slice(2, 8).toUpperCase();
+
+// Compass directions used to cluster hostiles for the WRAITH rail. Aiming at
+// the most populated lane keeps the cannon on the densest group instead of the
+// pointer, which is what makes the skill read as a screen-wide sweep.
+const AIM_BUCKETS = 16;
+const RAIL_LOCK_TIME = 0.45;
+// The rail is a wide lance: everything inside this half-width is swept, which
+// is what lets one cast clear a whole side of the field.
+const RAIL_HALF_WIDTH = 150;
+const RAIL_LENGTH = 1750;
+const RAIL_NORMAL_DAMAGE = 30;
+const angleInBucket = (angle: number, bucket: number) => {
+  const width = TAU / AIM_BUCKETS;
+  return Math.abs(angleDelta(bucket * width + width / 2, angle)) <= width / 2;
+};
 
 function hashSeed(seed: string) {
   let hash = 2166136261;
@@ -75,7 +99,8 @@ interface Enemy {
   xp: number; angle: number; lockedAngle: number; fireTimer: number; age: number; flash: number;
   elite: boolean; dead: boolean; showLabel: boolean; contactTimer: number; telegraph: number; stun: number;
   lastHitBy: 'player' | 'echo' | null; lastHitAt: number; syncCooldown: number;
-  phase: number; pattern: number; seed: number;
+  phase: number; pattern: number; seed: number; specialTimer: number;
+  bossKind?: BossKind;
 }
 interface Projectile {
   id: number; x: number; y: number; vx: number; vy: number; radius: number;
@@ -89,7 +114,7 @@ interface Particle {
 interface Pickup { x: number; y: number; vx: number; vy: number; value: number; kind: 'xp' | 'health'; age: number; }
 interface Beam {
   points: { x: number; y: number }[]; life: number; maxLife: number; color: string; kind?: 'arc' | 'rail';
-  tickDamage?: number; tickTimer?: number;
+  tickDamage?: number; tickTimer?: number; tickInterval?: number; ticksLeft?: number; halfWidth?: number;
 }
 interface FloatText { x: number; y: number; text: string; color: string; life: number; size: number; }
 interface Field { x: number; y: number; life: number; maxLife: number; tick: number; }
@@ -139,7 +164,7 @@ const ANOMALIES: Anomaly[] = [
 ];
 
 export const WEAPON_SKILLS: Record<CoreId, { name: string; enName: string; description: string; cooldown: number }> = {
-  wraith: { name: '貫通レール', enName: 'RAIL LANCE', description: '照準方向を貫き、1秒間継続ダメージを与える高威力レール', cooldown: 5 },
+  wraith: { name: '貫通レール', enName: 'RAIL LANCE', description: '敵が最も密集する方向を自動で狙い、幅広い射線上の通常敵を一掃する', cooldown: 5 },
   tempest: { name: '連鎖サンダー', enName: 'CIRCUIT BREAK', description: '周囲の敵へ雷撃＋短時間の行動停止', cooldown: 7 },
   bastion: { name: 'ノヴァバースト', enName: 'NOVA BURST', description: '周囲へ衝撃波＋敵弾消去＋ノックバック', cooldown: 7 },
 };
@@ -179,6 +204,7 @@ export class GameEngine {
   private activeBonuses: BonusLoadout = {};
   private bossSpawned = false;
   private bossDefeated = false;
+  private cleanupStarted = false;
   private seed = 'ECHO';
   private player!: Player;
   private keys = new Set<string>();
@@ -223,6 +249,9 @@ export class GameEngine {
   private seenKinds = new Set<EnemyKind>();
   private bossId: number | null = null;
   private pendingBossDraft = false;
+  // Last rail lane plus the timestamp it was chosen, so the cannon keeps its
+  // heading briefly instead of snapping between crowded directions.
+  private railAim: { angle: number; at: number } | null = null;
   private shotCounter = 0;
   private dashHit = new Set<number>();
   private shake = 0;
@@ -242,8 +271,18 @@ export class GameEngine {
     return Math.max(1, Math.floor(this.sector / 3));
   }
 
+  private get currentBossKind(): BossKind {
+    if (this.challenge) return this.challenge.bossKind;
+    return bossKindForEncounter(Math.max(1, Math.floor(this.sector / 3)));
+  }
+
   private get infiniteDepth() {
     return this.challenge ? 0 : Math.floor((this.sector - 1) / INFINITE_CHECKPOINT_INTERVAL);
+  }
+
+  private get combatXpScale() {
+    if (this.challenge) return this.challenge.enemyXp;
+    return 1 + Math.min(1.5, (this.sector - 1) * 0.012 + this.infiniteDepth * 0.04);
   }
 
   private get infiniteNormalHealthScale() {
@@ -320,9 +359,9 @@ export class GameEngine {
       stats.dashCooldown = INFINITE_ABILITY_COOLDOWN.dash;
       stats.echoCooldown = INFINITE_ABILITY_COOLDOWN.echo;
     }
-    const campaignXp = readCampaignXp();
+    const purchasedBonuses = readInitialBonuses();
     this.activeBonuses = this.challenge
-      ? sanitizeBonusLoadout(bonuses ?? readInitialBonuses(campaignXp), getBonusPoints(campaignXp))
+      ? sanitizeBonusLoadout(bonuses ?? purchasedBonuses, purchasedBonuses)
       : {};
     this.initialBonusRanks = countBonusRanks(this.activeBonuses);
     if (this.challenge) applyInitialBonuses(stats, this.activeBonuses);
@@ -331,16 +370,17 @@ export class GameEngine {
       hp: stats.maxHp, stats, fireTimer: 0.2, invulnerable: 1,
       dashTimer: 0, dashCooldown: 0, echoCooldown: 0,
       shieldReady: false, shieldTimer: stats.shieldInterval,
-      sync: 0, overdrive: 0, weaponCooldown: 0, level: 1, xp: 0, xpNext: 30,
+      sync: 0, overdrive: 0, weaponCooldown: 0, level: 1, xp: 0, xpNext: getRunXpRequirement(1),
     };
     this.enemies = []; this.projectiles = []; this.particles = []; this.pickups = [];
     this.echoes = []; this.beams = []; this.texts = []; this.fields = []; this.history = [];
     this.shockwaves = []; this.rift = null; this.riftSpawned = false;
-    this.pendingShots = []; this.elapsed = 0; this.sector = 1;
+    this.pendingShots = []; this.elapsed = 0; this.sector = 1; this.railAim = null;
     this.sectorTime = 0;
     this.anomaly = this.challenge && this.challengeLevel > 1 ? ANOMALIES[(this.challengeLevel - 2) % ANOMALIES.length]! : null;
     this.bossSpawned = false;
     this.bossDefeated = false;
+    this.cleanupStarted = false;
     this.spawnTimer = 2; this.score = 0; this.kills = 0;
     this.level = 1; this.combo = 0; this.bestCombo = 0; this.comboTimer = 0;
     this.echoesCreated = 0; this.rerolls = 1; this.nextId = 1; this.seenKinds.clear(); this.bossId = null;
@@ -357,7 +397,12 @@ export class GameEngine {
     await this.sound.unlock();
     this.setStatus('running');
     this.callbacks.onDraft(null);
-    if (this.challenge) this.toast(`LEVEL ${formatStage(this.challenge.id)} // ${this.challenge.enName}`, `「${this.challenge.name}」開始`, `初期ボーナス ${this.initialBonusRanks}Pt / ワーデンと残敵を全滅せよ`, 'gold');
+    if (this.challenge) this.toast(
+      `LEVEL ${formatStage(this.challenge.id)} // ${this.challenge.enName}`,
+      `「${this.challenge.name}」開始`,
+      `初期ボーナス ${this.initialBonusRanks}Pt / ${this.challenge.hasBoss ? 'ボスと残敵を全滅せよ' : '時間終了後、残敵を全滅せよ'}`,
+      'gold',
+    );
     else this.toast('TIMELINE 01', '潜行開始', '過去の自分と同期せよ', 'cyan');
     this.emitHud();
   }
@@ -480,7 +525,9 @@ export class GameEngine {
       weaponCooldown: this.player?.weaponCooldown, manualShots: this.pointer.manualShots, tutorialStep: this.tutorialStep,
       gameMode: this.gameMode, challengeLevel: this.challenge?.id ?? 0, reviveUsed: this.reviveUsed,
       initialBonusRanks: this.initialBonusRanks, initialBonuses: { ...this.activeBonuses },
-      bossDefeated: this.bossDefeated, remainingEnemies: this.enemies.filter(enemy => !enemy.dead).length,
+      bossDefeated: this.bossDefeated, cleanupStarted: this.cleanupStarted,
+      remainingEnemies: this.enemies.filter(enemy => !enemy.dead).length,
+      bossKind: this.enemies.find(enemy => enemy.id === this.bossId && !enemy.dead)?.bossKind ?? null,
       checkpointKind: this.checkpointKind, buildCheckpointShown: this.buildCheckpointShown,
       rift: this.rift ? { x: this.rift.x, y: this.rift.y, progress: this.rift.progress, life: this.rift.life } : null,
       player: this.player ? { x: this.player.x, y: this.player.y } : null,
@@ -502,9 +549,9 @@ export class GameEngine {
     this.keys.add(event.code);
     if (event.repeat || this.status !== 'running') return;
     if (event.code === 'Space' || event.code === 'ShiftLeft') this.dash();
+    if (event.code === 'KeyQ') this.triggerWeaponSkill();
     if (event.code === 'KeyE') this.createEcho();
-    if (event.code === 'KeyR') this.triggerWeaponSkill();
-    if (event.code === 'KeyQ') this.activateOverdrive();
+    if (event.code === 'KeyR') this.activateOverdrive();
   };
 
   private onKeyUp = (event: KeyboardEvent) => { this.keys.delete(event.code); };
@@ -645,9 +692,9 @@ export class GameEngine {
     this.texts = this.texts.filter(text => text.life > 0);
     if (this.particles.length > 650) this.particles.splice(0, this.particles.length - 650);
 
-    // Boss death opens the cleanup phase; the stage ends only after every
-    // remaining hostile (including splitter mites and boss summons) is gone.
-    if (this.bossDefeated && this.status === 'running' && this.enemies.length === 0) {
+    // Boss stages enter cleanup on boss death; normal stages enter it when
+    // their combat timer expires. Both require every remaining hostile to die.
+    if (this.challenge && this.cleanupStarted && this.status === 'running' && this.enemies.length === 0) {
       this.gameOver(true);
       return;
     }
@@ -754,12 +801,22 @@ export class GameEngine {
   private updateDirector(dt: number) {
     const boss = this.enemies.find(enemy => enemy.kind === 'boss' && !enemy.dead);
     if (!boss) {
-      if (!this.bossDefeated) this.sectorTime += dt;
+      if (!this.cleanupStarted) this.sectorTime += dt;
       if (this.challenge) {
-        if (!this.bossSpawned && !this.bossDefeated && this.sectorTime >= this.challenge.combatDuration) {
-          this.bossSpawned = true;
+        if (!this.bossSpawned && !this.cleanupStarted && this.sectorTime >= this.challenge.combatDuration) {
           this.rift = null;
-          this.spawnBoss();
+          if (this.challenge.hasBoss) {
+            this.bossSpawned = true;
+            this.spawnBoss();
+          } else {
+            this.cleanupStarted = true;
+            this.toast(
+              'COMBAT WINDOW SEALED // CLEANUP',
+              '残敵を掃討せよ',
+              '通常出現を停止。全ての敵を倒すとレベル完了',
+              'gold',
+            );
+          }
         }
       } else {
         if (!this.bossSpawned && this.sector % 3 === 0 && this.sectorTime >= INFINITE_ROUND_SPAWN_PAUSE) {
@@ -787,7 +844,7 @@ export class GameEngine {
       }
     }
 
-    if (!boss && !this.bossDefeated && (this.sector >= 2 || (this.challenge && this.challenge.id >= 2)) && !this.riftSpawned && this.sectorTime > 10) {
+    if (!boss && !this.cleanupStarted && (this.sector >= 2 || (this.challenge && this.challenge.id >= 2)) && !this.riftSpawned && this.sectorTime > 10) {
       let x = W / 2, y = H / 2;
       for (let attempt = 0; attempt < 8; attempt++) {
         x = this.random.range(170, W - 170); y = this.random.range(160, H - 170);
@@ -804,7 +861,7 @@ export class GameEngine {
     const maxEnemies = this.challenge
       ? Math.min(60, 34 + enemyTier * 2)
       : Math.round((Math.min(125, 55 + enemyTier * 8) + depth * INFINITE_DEPTH_SCALING.enemyCap) * (this.difficulty === 'abyss' ? ABYSS_MODIFIER.enemyCap : 1));
-    if (!this.bossDefeated && this.spawnTimer <= 0 && this.enemies.length < maxEnemies) {
+    if (!this.cleanupStarted && this.spawnTimer <= 0 && this.enemies.length < maxEnemies) {
       const difficultyScale = this.difficulty === 'abyss' ? ABYSS_MODIFIER.spawnRate : 1;
       const depthSpawnRate = this.challenge ? 1 : 1 + depth * INFINITE_DEPTH_SCALING.spawnRate;
       const stageSpawnRate = this.challenge?.spawnRate ?? 1;
@@ -904,10 +961,10 @@ export class GameEngine {
       id: this.nextId++, kind, x, y, vx: 0, vy: 0, radius: radius * (elite ? 1.22 : 1),
       hp, maxHp: hp, speed: speed * (1 + Math.min(0.35, tier * 0.018)) * (this.challenge?.enemySpeed ?? 1) * (this.anomaly?.speed ?? 1) * (this.difficulty === 'abyss' ? ABYSS_MODIFIER.speed : 1),
       damage: damage * damageScale,
-      xp: xp * (elite ? 3 : 1) * (this.anomaly?.xp ?? 1), angle: 0, lockedAngle: 0, fireTimer: this.random.range(0.5, 2),
+      xp: xp * (elite ? 3 : 1) * (this.anomaly?.xp ?? 1) * this.combatXpScale, angle: 0, lockedAngle: 0, fireTimer: this.random.range(0.5, 2),
       age: 0, flash: 0, elite, dead: false, showLabel: false, contactTimer: 0, telegraph: 0, stun: 0,
       lastHitBy: null, lastHitAt: -10, syncCooldown: 0, phase: 1,
-      pattern: 0, seed: this.random.range(0, 100),
+      pattern: 0, seed: this.random.range(0, 100), specialTimer: 0,
     };
     if (!this.seenKinds.has(kind)) {
       enemy.showLabel = true;
@@ -916,25 +973,26 @@ export class GameEngine {
     this.enemies.push(enemy);
   }
 
-  private spawnBoss() {
+  private spawnBoss(kind = this.currentBossKind) {
     const tier = this.bossTier;
+    const definition = BOSS_DEFINITIONS[kind];
     const hp = 1250 * (1 + (tier - 1) * 0.82) * (this.challenge?.bossHealth ?? 1) * Math.pow(INFINITE_DEPTH_SCALING.bossHealth, this.infiniteDepth) * (this.difficulty === 'abyss' ? ABYSS_MODIFIER.bossHealth : 1);
     const bossDamageScale = this.challenge ? 1 + (this.challenge.enemyDamage - 1) * 0.65 : 1;
     const enemy: Enemy = {
-      id: this.nextId++, kind: 'boss', x: W / 2, y: 115, vx: 0, vy: 0, radius: 64,
-      hp, maxHp: hp, speed: 48 + tier * 3, damage: (26 + tier * 3) * bossDamageScale, xp: 100 + tier * 20,
+      id: this.nextId++, kind: 'boss', x: W / 2, y: 115, vx: 0, vy: 0, radius: definition.radius,
+      hp, maxHp: hp, speed: (48 + tier * 3) * definition.speed, damage: (26 + tier * 3) * bossDamageScale, xp: (100 + tier * 20) * this.combatXpScale,
       angle: 0, lockedAngle: 0, fireTimer: 1.8, age: 0, flash: 0, elite: true, dead: false,
       showLabel: false, contactTimer: 0, telegraph: 0, stun: 0, lastHitBy: null, lastHitAt: -10,
-      syncCooldown: 0, phase: 1, pattern: 0, seed: this.random.range(0, 100),
+      syncCooldown: 0, phase: 1, pattern: 0, seed: this.random.range(0, 100), specialTimer: 0, bossKind: kind,
     };
     this.enemies.push(enemy);
     this.bossId = enemy.id;
     this.sound.play('boss');
     this.shake = 12;
     this.toast(
-      this.challenge ? `LEVEL ${formatStage(this.challenge.id)} // FINAL TARGET` : `ABYSSAL WARDEN // ${String(tier).padStart(2, '0')}`,
-      tier === 1 ? 'AION、顕現' : 'AION、再構成',
-      '攻撃パターンを読み、残響で挟み撃ちにせよ',
+      this.challenge ? `LEVEL ${formatStage(this.challenge.id)} // ${definition.name}` : `${definition.name} // ${String(tier).padStart(2, '0')}`,
+      `${definition.title}、顕現`,
+      definition.description,
       'coral',
     );
   }
@@ -953,7 +1011,7 @@ export class GameEngine {
       this.score += 1200 * (this.difficulty === 'abyss' ? 1.5 : 1);
       for (let i = 0; i < 6; i++) {
         const angle = i * TAU / 6;
-        this.pickups.push({ x: rift.x + Math.cos(angle) * 34, y: rift.y + Math.sin(angle) * 34, vx: Math.cos(angle) * 80, vy: Math.sin(angle) * 80, value: 8, kind: 'xp', age: 0 });
+        this.pickups.push({ x: rift.x + Math.cos(angle) * 34, y: rift.y + Math.sin(angle) * 34, vx: Math.cos(angle) * 80, vy: Math.sin(angle) * 80, value: 8 * this.combatXpScale, kind: 'xp', age: 0 });
       }
       this.shockwaves.push({ x: rift.x, y: rift.y, life: 0.65, maxLife: 0.65, radius: 220, color: '#62f6e7' });
       this.toast('RIFT STABILIZED', '同期リフト安定化', 'ZERO +35 / HP +15% / 欠片を獲得', 'gold');
@@ -1056,11 +1114,22 @@ export class GameEngine {
       : hpRatio < 0.32 ? 3 : hpRatio < 0.67 ? 2 : 1;
     if (nextPhase !== enemy.phase) {
       enemy.phase = nextPhase;
+      enemy.specialTimer = 0;
+      enemy.telegraph = 0;
       this.shake = 15;
       this.flash = 0.35;
-      for (let i = 0; i < 12 + nextPhase * 2; i++) this.enemyShot(enemy.x, enemy.y, i * TAU / (12 + nextPhase * 2), 155, enemy.damage * 0.55, 6);
+      for (let i = 0; i < 12 + nextPhase * 2; i++) this.fireBossShot(enemy, i * TAU / (12 + nextPhase * 2), 155, 0.55, 6);
       this.toast(`PHASE 0${nextPhase}`, nextPhase === 2 ? '制限解除' : '深淵臨界', '弾幕が加速します', 'coral');
     }
+    switch (enemy.bossKind ?? 'warden') {
+      case 'lancer': this.updateLancerBoss(enemy, dt, nx, ny, dist); break;
+      case 'choir': this.updateChoirBoss(enemy, dt, nx, ny, dist); break;
+      case 'colossus': this.updateColossusBoss(enemy, dt, nx, ny, dist); break;
+      default: this.updateWardenBoss(enemy, dt, nx, ny, dist); break;
+    }
+  }
+
+  private updateWardenBoss(enemy: Enemy, dt: number, nx: number, ny: number, dist: number) {
     const radial = dist > 390 ? 0.7 : dist < 260 ? -0.55 : 0;
     enemy.vx = nx * enemy.speed * radial - ny * enemy.speed * 0.6;
     enemy.vy = ny * enemy.speed * radial + nx * enemy.speed * 0.6;
@@ -1070,15 +1139,114 @@ export class GameEngine {
       const pattern = enemy.pattern % 3;
       if (pattern === 0) {
         const count = 12 + enemy.phase * 4;
-        for (let i = 0; i < count; i++) this.enemyShot(enemy.x, enemy.y, i * TAU / count + enemy.age * 0.45, 175 + enemy.phase * 20, enemy.damage * 0.55, 6);
+        for (let i = 0; i < count; i++) this.fireBossShot(enemy, i * TAU / count + enemy.age * 0.45, 175 + enemy.phase * 20, 0.55, 6);
       } else if (pattern === 1) {
         const shots = 3 + enemy.phase * 2;
-        for (let i = 0; i < shots; i++) this.enemyShot(enemy.x, enemy.y, enemy.angle + (i - (shots - 1) / 2) * 0.13, 300, enemy.damage * 0.7, 7);
+        for (let i = 0; i < shots; i++) this.fireBossShot(enemy, enemy.angle + (i - (shots - 1) / 2) * 0.13, 300, 0.7, 7);
       } else {
         const amount = Math.min(5, 1 + enemy.phase);
         for (let i = 0; i < amount; i++) this.spawnEnemy(i % 2 ? 'dart' : 'drone', enemy.x + Math.cos(i * TAU / amount) * 90, enemy.y + Math.sin(i * TAU / amount) * 90);
       }
       enemy.fireTimer = Math.max(1.15, 2.35 - enemy.phase * 0.25);
+    }
+  }
+
+  private updateLancerBoss(enemy: Enemy, dt: number, nx: number, ny: number, dist: number) {
+    const definition = BOSS_DEFINITIONS.lancer;
+    if (enemy.specialTimer > 0) {
+      enemy.specialTimer -= dt;
+      this.particle(enemy.x, enemy.y, definition.color, 1, 85, 0.25, 5);
+      if (enemy.specialTimer <= 0) enemy.fireTimer = 0.85;
+      return;
+    }
+    if (enemy.telegraph > 0) {
+      enemy.vx = 0; enemy.vy = 0;
+      enemy.telegraph -= dt;
+      if (enemy.telegraph <= 0) {
+        if (enemy.pattern % 2 === 0) {
+          enemy.specialTimer = 0.38 + enemy.phase * 0.03;
+          const speed = 610 + enemy.phase * 45;
+          enemy.vx = Math.cos(enemy.lockedAngle) * speed;
+          enemy.vy = Math.sin(enemy.lockedAngle) * speed;
+          this.shake = Math.max(this.shake, 8);
+        } else {
+          const shots = 3 + enemy.phase * 2;
+          for (let i = 0; i < shots; i++) this.fireBossShot(enemy, enemy.lockedAngle + (i - (shots - 1) / 2) * 0.1, 460 + enemy.phase * 25, 0.52, 6);
+          enemy.fireTimer = Math.max(1.1, 1.75 - enemy.phase * 0.12);
+        }
+      }
+      return;
+    }
+    const radial = dist > 520 ? 0.85 : dist < 370 ? -0.65 : 0;
+    enemy.vx = nx * enemy.speed * radial - ny * enemy.speed * 0.85;
+    enemy.vy = ny * enemy.speed * radial + nx * enemy.speed * 0.85;
+    enemy.fireTimer -= dt;
+    if (enemy.fireTimer <= 0) {
+      enemy.pattern++;
+      enemy.lockedAngle = enemy.angle;
+      enemy.telegraph = Math.max(0.6, 1 - enemy.phase * 0.08);
+    }
+  }
+
+  private updateChoirBoss(enemy: Enemy, dt: number, nx: number, ny: number, dist: number) {
+    const radial = dist > 400 ? 0.55 : dist < 280 ? -0.4 : 0;
+    enemy.vx = nx * enemy.speed * radial - ny * enemy.speed * 0.85;
+    enemy.vy = ny * enemy.speed * radial + nx * enemy.speed * 0.85;
+    enemy.fireTimer -= dt;
+    if (enemy.fireTimer > 0) return;
+    enemy.pattern++;
+    const pattern = enemy.pattern % 3;
+    if (pattern === 1) {
+      const count = 6 + enemy.phase * 2;
+      for (let i = 0; i < count; i++) {
+        const angle = enemy.age * 0.85 + i * 0.3;
+        this.fireBossShot(enemy, angle, 190 + enemy.phase * 15, 0.34, 5);
+        this.fireBossShot(enemy, angle + Math.PI, 190 + enemy.phase * 15, 0.34, 5);
+      }
+    } else if (pattern === 2) {
+      const shots = 4 + enemy.phase * 2;
+      for (let i = 0; i < shots; i++) this.fireBossShot(enemy, enemy.angle + (i - (shots - 1) / 2) * 0.16, 280, 0.42, 6);
+    } else {
+      const weavers = this.enemies.filter(target => !target.dead && target.kind === 'weaver').length;
+      const amount = Math.min(enemy.phase >= 3 ? 2 : 1, Math.max(0, 2 - weavers));
+      for (let i = 0; i < amount; i++) this.spawnEnemy('weaver', enemy.x + (i ? 95 : -95), enemy.y + 65);
+      const count = 6 + enemy.phase * 2;
+      for (let i = 0; i < count; i++) this.fireBossShot(enemy, i * TAU / count - enemy.age * 0.55, 165, 0.32, 5);
+    }
+    enemy.fireTimer = Math.max(1, 2.1 - enemy.phase * 0.18);
+  }
+
+  private updateColossusBoss(enemy: Enemy, dt: number, nx: number, ny: number, dist: number) {
+    if (enemy.telegraph > 0) {
+      enemy.vx = 0; enemy.vy = 0;
+      enemy.telegraph -= dt;
+      if (enemy.telegraph <= 0) {
+        const radius = 280;
+        const definition = BOSS_DEFINITIONS.colossus;
+        this.shockwaves.push({ x: enemy.x, y: enemy.y, life: 0.65, maxLife: 0.65, radius, color: definition.color });
+        if (distance(this.player.x, this.player.y, enemy.x, enemy.y) < radius + this.player.radius) this.hurtPlayer(enemy.damage * 0.72);
+        const count = 10 + enemy.phase * 2;
+        for (let i = 0; i < count; i++) this.fireBossShot(enemy, i * TAU / count, 210, 0.32, 7);
+        this.sound.play('explode', 0.8);
+        this.shake = Math.max(this.shake, 14);
+        enemy.fireTimer = Math.max(1.3, 2.5 - enemy.phase * 0.15);
+      }
+      return;
+    }
+    const radial = dist > 350 ? 0.55 : dist < 250 ? -0.25 : 0;
+    enemy.vx = nx * enemy.speed * radial - ny * enemy.speed * 0.25;
+    enemy.vy = ny * enemy.speed * radial + nx * enemy.speed * 0.25;
+    enemy.fireTimer -= dt;
+    if (enemy.fireTimer > 0) return;
+    enemy.pattern++;
+    if (enemy.pattern % 2 === 1) {
+      enemy.telegraph = 1.05;
+    } else {
+      const count = 8 + enemy.phase * 2;
+      for (let i = 0; i < count; i++) this.fireBossShot(enemy, i * TAU / count + enemy.pattern * 0.17, 190 + enemy.phase * 15, 0.44, 8);
+      const tankExists = this.enemies.some(target => !target.dead && target.kind === 'tank');
+      if (enemy.phase >= 2 && !tankExists) this.spawnEnemy('tank', enemy.x + 100, enemy.y + 80);
+      enemy.fireTimer = Math.max(1.4, 2.6 - enemy.phase * 0.16);
     }
   }
 
@@ -1187,13 +1355,24 @@ export class GameEngine {
       if (beam.kind !== 'rail' || beam.tickDamage === undefined || beam.life <= 0) continue;
       const [start, end] = beam.points;
       if (!start || !end) continue;
-      beam.tickTimer = (beam.tickTimer ?? 0.3) - Math.min(dt, beam.life);
+      const interval = beam.tickInterval ?? 0.3;
+      beam.tickTimer = (beam.tickTimer ?? interval) - Math.min(dt, beam.life);
       let hits = 0;
       while (beam.tickTimer <= 0) {
-        beam.tickTimer += 0.3;
+        beam.tickTimer += interval;
+        // The beam carries a fixed tick budget, so one large update step can
+        // never squeeze extra hits out of a beam that has already expired.
+        if (beam.ticksLeft !== undefined) {
+          if (beam.ticksLeft <= 0) break;
+          beam.ticksLeft--;
+        }
         for (const enemy of this.enemies) {
-          if (!enemy.dead && distanceToSegment(enemy.x, enemy.y, start.x, start.y, end.x, end.y) < enemy.radius + 24) {
-            this.damageEnemy(enemy, beam.tickDamage, 'player');
+          const reach = (beam.halfWidth ?? 24) + enemy.radius;
+          if (!enemy.dead && distanceToSegment(enemy.x, enemy.y, start.x, start.y, end.x, end.y) < reach) {
+            // The sweep already erased normal enemies; the lingering beam keeps
+            // pressuring bosses and anything that drifted into the lane.
+            const damage = enemy.kind === 'boss' ? beam.tickDamage : Math.max(beam.tickDamage, enemy.hp * 1.02);
+            this.damageEnemy(enemy, damage, 'player');
             hits++;
           }
         }
@@ -1214,6 +1393,49 @@ export class GameEngine {
     for (const text of this.texts) { text.life -= dt; text.y -= dt * 28; }
   }
 
+  // Picks the direction that covers the most hostiles: sweep the compass in
+  // 16 lanes, score each lane by target count and proximity, then fire down the
+  // best one. Clustered packs win because a narrow lane still covers all of
+  // them, while single scattered enemies rarely justify the shot.
+  private getRailAimAngle() {
+    const p = this.player;
+    // Bosses participate, but a single target scores far lower than a pack, so
+    // a crowd wins while a lone boss still gets aimed at instead of firing blind.
+    const candidates = this.enemies.filter(enemy => !enemy.dead);
+    if (candidates.length === 0) return this.pointer.inside ? Math.atan2(this.pointer.y - p.y, this.pointer.x - p.x) : p.angle;
+    const width = TAU / AIM_BUCKETS;
+    // Score the same corridor the beam will actually sweep so the chosen lane
+    // matches the targets that die, not just their compass bucket.
+    const reaches = (angle: number, enemy: Enemy) => {
+      const endX = p.x + Math.cos(angle) * RAIL_LENGTH;
+      const endY = p.y + Math.sin(angle) * RAIL_LENGTH;
+      return distanceToSegment(enemy.x, enemy.y, p.x, p.y, endX, endY) < RAIL_HALF_WIDTH + enemy.radius;
+    };
+    let bestAngle = p.angle;
+    let bestScore = -Infinity;
+    for (let bucket = 0; bucket < AIM_BUCKETS; bucket++) {
+      const angle = bucket * width + width / 2;
+      let score = 0;
+      for (const enemy of candidates) {
+        if (!angleInBucket(Math.atan2(enemy.y - p.y, enemy.x - p.x), bucket)) continue;
+        if (!reaches(angle, enemy)) continue;
+        // Close and heavy targets matter more, but never enough to outvote a
+        // large pack sitting on one lane.
+        score += 1 + Math.min(1, 420 / Math.max(60, distance(p.x, p.y, enemy.x, enemy.y))) + Math.min(1, enemy.hp / 900);
+      }
+      if (score > bestScore) { bestScore = score; bestAngle = angle; }
+    }
+    // All lanes empty (e.g. a lone boss behind us): fall back to the target.
+    if (bestScore <= 0) {
+      const nearest = candidates.reduce((best, enemy) => {
+        const d = distance(p.x, p.y, enemy.x, enemy.y);
+        return !best || d < best.d ? { enemy, d } : best;
+      }, null as { enemy: Enemy; d: number } | null);
+      if (nearest) return Math.atan2(nearest.enemy.y - p.y, nearest.enemy.x - p.x);
+    }
+    return bestAngle;
+  }
+
   private useWeaponSkill() {
     const p = this.player;
     if (p.weaponCooldown > 0) return;
@@ -1223,19 +1445,30 @@ export class GameEngine {
     }
     p.weaponCooldown = this.weaponSkillCooldown;
     this.tutorialWeaponUsed = true;
-    const angle = this.pointer.inside ? Math.atan2(this.pointer.y - p.y, this.pointer.x - p.x) : p.angle;
 
     if (this.core === 'wraith') {
-      const endX = p.x + Math.cos(angle) * 1250;
-      const endY = p.y + Math.sin(angle) * 1250;
+      // Hold the previous lane for a moment so rapid presses keep the cannon
+      // steady, then re-aim at the densest cluster once the lock expires.
+      if (!this.railAim || this.elapsed - this.railAim.at > RAIL_LOCK_TIME) {
+        this.railAim = { angle: this.getRailAimAngle(), at: this.elapsed };
+      }
+      const angle = this.railAim.angle;
+      const endX = p.x + Math.cos(angle) * RAIL_LENGTH;
+      const endY = p.y + Math.sin(angle) * RAIL_LENGTH;
       this.beams.push({
         points: [{ x: p.x, y: p.y }, { x: endX, y: endY }],
-        life: 1, maxLife: 1, color: '#8dfff3', kind: 'rail', tickDamage: p.stats.damage * 0.75, tickTimer: 0.3,
+        life: 1, maxLife: 1, color: '#8dfff3', kind: 'rail', tickDamage: p.stats.damage * 0.75, tickTimer: 0.3, tickInterval: 0.3, ticksLeft: 3,
+        halfWidth: RAIL_HALF_WIDTH,
       });
       for (const enemy of this.enemies) {
-        if (!enemy.dead && distanceToSegment(enemy.x, enemy.y, p.x, p.y, endX, endY) < enemy.radius + 24) {
-          this.damageEnemy(enemy, p.stats.damage * 6, 'player');
-        }
+        if (enemy.dead) continue;
+        if (distanceToSegment(enemy.x, enemy.y, p.x, p.y, endX, endY) >= RAIL_HALF_WIDTH + enemy.radius) continue;
+        // Bosses take the tuned single-target hit; every other hostile caught
+        // in the lane is erased outright so one cast reads as a full sweep.
+        const lethal = enemy.kind === 'boss'
+          ? p.stats.damage * 6
+          : Math.max(p.stats.damage * RAIL_NORMAL_DAMAGE, enemy.hp * 1.02);
+        this.damageEnemy(enemy, lethal, 'player');
       }
       for (let i = 0; i < 28; i++) {
         const t = Math.random();
@@ -1381,13 +1614,18 @@ export class GameEngine {
     this.beams.push({ points, life: 0.16, maxLife: 0.16, color: source === 'echo' ? ECHO_COLOR : '#aa96ff' });
   }
 
-  private enemyShot(x: number, y: number, angle: number, speed: number, damage: number, radius: number) {
+  private enemyShot(x: number, y: number, angle: number, speed: number, damage: number, radius: number, color = '#ff6078') {
     if (this.projectiles.length > 480) return;
     this.projectiles.push({
       id: this.nextId++, x, y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed,
-      radius, damage, life: 5, friendly: false, color: '#ff6078', pierce: 0,
+      radius, damage, life: 5, friendly: false, color, pierce: 0,
       source: 'enemy', hit: new Set(), kind: 'enemy',
     });
+  }
+
+  private fireBossShot(enemy: Enemy, angle: number, speed: number, damageScale: number, radius = 6) {
+    const definition = BOSS_DEFINITIONS[enemy.bossKind ?? 'warden'];
+    this.enemyShot(enemy.x, enemy.y, angle, speed, enemy.damage * damageScale, radius, definition.color);
   }
 
   private damageEnemy(enemy: Enemy, baseDamage: number, source: 'player' | 'echo') {
@@ -1424,19 +1662,20 @@ export class GameEngine {
     this.kills++;
     this.score += (enemy.maxHp * 2 + enemy.xp * 12) * (this.difficulty === 'abyss' ? 1.5 : 1) * (this.anomaly?.score ?? 1);
     const pieces = enemy.kind === 'boss' ? 55 : enemy.elite ? 18 : 7;
-    const color = enemy.kind === 'boss' ? '#ff6078' : enemy.elite ? '#ffcf70' : '#62f6e7';
+    const color = enemy.kind === 'boss' ? BOSS_DEFINITIONS[enemy.bossKind ?? 'warden'].color : enemy.elite ? '#ffcf70' : '#62f6e7';
     for (let i = 0; i < pieces; i++) this.particle(enemy.x, enemy.y, color, 1, enemy.kind === 'boss' ? 310 : 180, 0.3 + Math.random() * 0.5, 3 + Math.random() * 5);
     this.sound.play('explode', enemy.kind === 'boss' ? 1.3 : 0.45);
     if (enemy.kind === 'boss') {
       this.bossId = null;
       if (this.challenge) {
         this.bossDefeated = true;
+        this.cleanupStarted = true;
         this.player.sync = 100;
         this.shake = 24;
         this.flash = 0.7;
         this.rift = null;
         this.toast(
-          this.challenge ? 'WARDEN ERASED // CLEANUP' : 'LAST WARDEN ERASED // CLEANUP',
+          `${BOSS_DEFINITIONS[enemy.bossKind ?? 'warden'].name} ERASED // CLEANUP`,
           '残敵を掃討せよ',
           this.challenge ? '出現を停止。全ての敵を倒すまでレベルは継続' : '出現を停止。全ての敵を倒すとタイムライン完了',
           'gold',
@@ -1450,7 +1689,7 @@ export class GameEngine {
       this.sectorTime = SECTOR_DURATION - 6;
       this.shake = 24;
       this.flash = 0.7;
-      for (let i = 0; i < 12; i++) this.pickups.push({ x: enemy.x + this.random.range(-90, 90), y: enemy.y + this.random.range(-90, 90), vx: 0, vy: 0, value: 12, kind: 'xp', age: 0 });
+      for (let i = 0; i < 12; i++) this.pickups.push({ x: enemy.x + this.random.range(-90, 90), y: enemy.y + this.random.range(-90, 90), vx: 0, vy: 0, value: 12 * this.combatXpScale, kind: 'xp', age: 0 });
       return;
     }
     if (enemy.kind === 'splitter') {
@@ -1591,7 +1830,7 @@ export class GameEngine {
       p.xp -= p.xpNext;
       this.level++;
       p.level = this.level;
-      p.xpNext = Math.floor(30 + (this.level - 1) * 22 + Math.pow(this.level - 1, 2) * 3);
+      p.xpNext = getRunXpRequirement(this.level);
       if (this.hasAvailableUpgrades()) this.openDraft('level');
       else if (!this.challenge) this.openBuildCheckpoint();
     }
@@ -1693,7 +1932,7 @@ export class GameEngine {
       level: this.level, echoes: this.echoesCreated, bestCombo: this.bestCombo,
       core: this.core, seed: this.seed, difficulty: this.difficulty,
       gameMode: this.gameMode, challengeLevel: this.challenge?.id ?? 0, victory, newBest,
-      xpEarned, totalXp, bonusPoints: getBonusPoints(totalXp), firstClear,
+      xpEarned, totalXp, firstClear,
       reviveAvailable: !victory && !this.challenge && !this.reviveUsed,
     });
   }
@@ -1707,14 +1946,18 @@ export class GameEngine {
     this.callbacks.onHud({
       hp: Math.max(0, p.hp), maxHp: p.stats.maxHp, shield: p.shieldReady,
       level: p.level, xp: p.xp, xpNext: p.xpNext, score: Math.floor(this.score),
-      sector: this.sector, sectorProgress: boss || this.bossDefeated ? 1 : this.sectorTime / (this.challenge?.combatDuration ?? SECTOR_DURATION),
+      sector: this.sector, sectorProgress: boss || this.cleanupStarted ? 1 : this.sectorTime / (this.challenge?.combatDuration ?? SECTOR_DURATION),
       anomaly: this.anomaly ? { name: this.anomaly.name, description: this.anomaly.description } : null,
       elapsed: this.elapsed, kills: this.kills,
       echoCooldown: p.echoCooldown, echoMaxCooldown: p.stats.echoCooldown,
       activeEchoes: this.echoes.length, maxEchoes: p.stats.maxEchoes,
       dashCooldown: p.dashCooldown, dashMaxCooldown: p.stats.dashCooldown,
       sync: p.sync, overdrive: p.overdrive, combo: this.combo,
-      boss: boss ? { name: `AION // WARDEN ${String(this.bossTier).padStart(2, '0')}`, hp: Math.max(0, boss.hp), maxHp: boss.maxHp, phase: boss.phase } : null,
+      boss: boss ? {
+        name: `${BOSS_DEFINITIONS[boss.bossKind ?? 'warden'].name} ${String(this.bossTier).padStart(2, '0')}`,
+        hp: Math.max(0, boss.hp), maxHp: boss.maxHp, phase: boss.phase,
+        color: BOSS_DEFINITIONS[boss.bossKind ?? 'warden'].color,
+      } : null,
       core: this.core, weapon: CORES.find(core => core.id === this.core)!.weapon,
       weaponDetail: this.core === 'wraith'
         ? `${p.stats.projectiles}弾・オート連射`
@@ -1732,7 +1975,8 @@ export class GameEngine {
       seed: this.seed, difficulty: this.difficulty,
       gameMode: this.gameMode, challengeLevel: this.challenge?.id ?? 0,
       challengeName: this.challenge?.name ?? '', challengeDuration: this.challenge?.combatDuration ?? 0,
-      challengeCleanup: this.bossDefeated,
+      challengeHasBoss: this.challenge?.hasBoss ?? false,
+      challengeCleanup: this.cleanupStarted,
       checkpointKind: this.checkpointKind,
       remainingEnemies: this.enemies.filter(enemy => !enemy.dead).length,
       initialBonusRanks: this.initialBonusRanks,
@@ -1910,9 +2154,11 @@ export class GameEngine {
       if (beam.kind === 'rail') {
         const [start, end] = beam.points;
         if (start && end) {
-          ctx.globalAlpha = alpha; ctx.strokeStyle = beam.color; ctx.shadowColor = beam.color; ctx.shadowBlur = 28;
-          ctx.lineCap = 'round'; ctx.lineWidth = 18 * alpha + 2;
+          ctx.globalAlpha = alpha * 0.22; ctx.strokeStyle = beam.color; ctx.shadowColor = beam.color; ctx.shadowBlur = 34;
+          ctx.lineCap = 'round'; ctx.lineWidth = (beam.halfWidth ?? 24) * 1.45 * (0.5 + alpha * 0.5);
           ctx.beginPath(); ctx.moveTo(start.x, start.y); ctx.lineTo(end.x, end.y); ctx.stroke();
+          ctx.globalAlpha = alpha; ctx.shadowBlur = 28; ctx.lineWidth = 18 * alpha + 2;
+          ctx.stroke();
           ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 3; ctx.stroke(); ctx.lineCap = 'butt';
         }
         continue;
@@ -1968,9 +2214,33 @@ export class GameEngine {
         ctx.stroke();
         ctx.setLineDash([]);
       }
+      if (enemy.kind === 'boss' && enemy.bossKind === 'lancer' && enemy.telegraph > 0) {
+        const definition = BOSS_DEFINITIONS.lancer;
+        ctx.save();
+        ctx.strokeStyle = definition.color;
+        ctx.globalAlpha = 0.35 + Math.sin(time * 24) * 0.15;
+        ctx.lineWidth = enemy.pattern % 2 === 0 ? 18 : 4;
+        ctx.setLineDash([20, 12]);
+        ctx.beginPath(); ctx.moveTo(enemy.x, enemy.y);
+        ctx.lineTo(enemy.x + Math.cos(enemy.lockedAngle) * 1800, enemy.y + Math.sin(enemy.lockedAngle) * 1800); ctx.stroke();
+        ctx.setLineDash([]); ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(enemy.x, enemy.y, enemy.radius + 14, 0, TAU); ctx.stroke();
+        ctx.restore();
+      }
+      if (enemy.kind === 'boss' && enemy.bossKind === 'colossus' && enemy.telegraph > 0) {
+        const charge = clamp(1 - enemy.telegraph / 1.05, 0, 1);
+        const definition = BOSS_DEFINITIONS.colossus;
+        ctx.save();
+        ctx.fillStyle = definition.color; ctx.globalAlpha = 0.035 + charge * 0.055;
+        ctx.beginPath(); ctx.arc(enemy.x, enemy.y, 280, 0, TAU); ctx.fill();
+        ctx.strokeStyle = definition.color; ctx.globalAlpha = 0.35 + charge * 0.6;
+        ctx.lineWidth = 2 + charge * 3; ctx.setLineDash([16, 10]);
+        ctx.beginPath(); ctx.arc(enemy.x, enemy.y, 280 + (1 - charge) * 90, 0, TAU); ctx.stroke();
+        ctx.setLineDash([]); ctx.restore();
+      }
       ctx.save(); ctx.translate(enemy.x, enemy.y); ctx.rotate(enemy.angle);
-      const color = enemy.flash > 0 ? '#ffffff' : enemy.kind === 'boss' ? ENEMY_COLORS.boss : enemy.elite ? '#ffcf70' : ENEMY_COLORS[enemy.kind];
-      ctx.strokeStyle = color; ctx.fillStyle = enemy.kind === 'boss' ? 'rgba(65,12,27,.88)' : 'rgba(32,13,24,.9)';
+      const color = enemy.flash > 0 ? '#ffffff' : enemy.kind === 'boss' ? BOSS_DEFINITIONS[enemy.bossKind ?? 'warden'].color : enemy.elite ? '#ffcf70' : ENEMY_COLORS[enemy.kind];
+      ctx.strokeStyle = color; ctx.fillStyle = enemy.kind === 'boss' ? BOSS_DEFINITIONS[enemy.bossKind ?? 'warden'].fill : 'rgba(32,13,24,.9)';
       ctx.lineWidth = enemy.elite ? 2.5 : 1.6; ctx.shadowColor = color; ctx.shadowBlur = enemy.flash > 0 ? 24 : 8;
       const r = enemy.radius;
       if (enemy.kind === 'drone' || enemy.kind === 'dart' || enemy.kind === 'mite') {
@@ -2017,21 +2287,7 @@ export class GameEngine {
         ctx.fillStyle = color;
         for (let i = 0; i < 6; i++) { const a = i * TAU / 6; ctx.beginPath(); ctx.arc(Math.cos(a) * r * 0.72, Math.sin(a) * r * 0.72, 2.2, 0, TAU); ctx.fill(); }
       } else if (enemy.kind === 'boss') {
-        ctx.rotate(time * 0.18);
-        for (let ring = 0; ring < 3; ring++) {
-          ctx.save(); ctx.rotate(ring * time * 0.22); ctx.setLineDash([24 - ring * 4, 14 + ring * 3]);
-          ctx.beginPath(); ctx.arc(0, 0, r + ring * 15, 0, TAU); ctx.stroke(); ctx.restore();
-        }
-        ctx.setLineDash([]);
-        ctx.beginPath(); for (let i = 0; i < 8; i++) { const a = i * TAU / 8; const px = Math.cos(a) * r * 0.8, py = Math.sin(a) * r * 0.8; i ? ctx.lineTo(px, py) : ctx.moveTo(px, py); } ctx.closePath(); ctx.fill(); ctx.stroke();
-        ctx.rotate(-time * 0.8); ctx.fillStyle = color; ctx.beginPath(); ctx.arc(0, 0, 15 + enemy.phase * 3, 0, TAU); ctx.fill();
-        if (enemy.fireTimer < 0.45) {
-          const charge = 1 - enemy.fireTimer / 0.45;
-          ctx.globalAlpha = 0.25 + charge * 0.65;
-          ctx.lineWidth = 3;
-          ctx.beginPath(); ctx.arc(0, 0, r + 52 - charge * 35, 0, TAU); ctx.stroke();
-          ctx.globalAlpha = 1;
-        }
+        this.drawBoss(ctx, enemy, time, color);
       }
       if (enemy.elite && enemy.kind !== 'boss') {
         ctx.strokeStyle = '#ffcf70'; ctx.lineWidth = 1; ctx.setLineDash([3, 6]);
@@ -2068,6 +2324,75 @@ export class GameEngine {
         ctx.restore();
       }
     }
+  }
+
+  private drawBoss(ctx: CanvasRenderingContext2D, enemy: Enemy, time: number, color: string) {
+    const r = enemy.radius;
+    const kind = enemy.bossKind ?? 'warden';
+    if (kind === 'lancer') {
+      ctx.save(); ctx.rotate(time * 0.65); ctx.setLineDash([18, 12]);
+      ctx.beginPath(); ctx.arc(0, 0, r + 17, 0, TAU); ctx.stroke(); ctx.restore();
+      ctx.setLineDash([]); ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(r * 1.35, 0); ctx.lineTo(-r * 0.75, r * 0.58);
+      ctx.lineTo(-r * 0.42, 0); ctx.lineTo(-r * 0.75, -r * 0.58); ctx.closePath(); ctx.fill(); ctx.stroke();
+      for (const side of [-1, 1]) {
+        ctx.beginPath(); ctx.moveTo(-r * 0.2, side * r * 0.42); ctx.lineTo(r * 0.62, side * r * 0.92);
+        ctx.lineTo(r * 0.35, side * r * 0.35); ctx.stroke();
+      }
+      ctx.fillStyle = color; ctx.beginPath(); ctx.arc(r * 0.12, 0, 11 + enemy.phase * 2, 0, TAU); ctx.fill();
+      if (enemy.specialTimer > 0) {
+        ctx.globalAlpha = 0.45; ctx.lineWidth = 5;
+        for (let i = 1; i <= 3; i++) { ctx.beginPath(); ctx.moveTo(-r * (0.8 + i * 0.4), -r * 0.35); ctx.lineTo(-r * (0.8 + i * 0.4), r * 0.35); ctx.stroke(); }
+      }
+    } else if (kind === 'choir') {
+      ctx.rotate(time * 0.25);
+      for (let ring = 0; ring < 3; ring++) {
+        ctx.save(); ctx.rotate(ring * Math.PI / 3 - time * (0.3 + ring * 0.12)); ctx.setLineDash([14 + ring * 3, 12]);
+        ctx.beginPath(); ctx.arc(0, 0, r + ring * 13, 0, TAU); ctx.stroke(); ctx.restore();
+      }
+      ctx.setLineDash([]);
+      for (let i = 0; i < 4; i++) {
+        const angle = i * TAU / 4 + time * 0.7;
+        ctx.fillStyle = color; ctx.beginPath(); ctx.arc(Math.cos(angle) * (r + 18), Math.sin(angle) * (r + 18), 6, 0, TAU); ctx.fill();
+      }
+      ctx.beginPath();
+      for (let i = 0; i < 12; i++) {
+        const angle = i * TAU / 12, radius = i % 2 ? r * 0.42 : r * 0.82;
+        i ? ctx.lineTo(Math.cos(angle) * radius, Math.sin(angle) * radius) : ctx.moveTo(Math.cos(angle) * radius, Math.sin(angle) * radius);
+      }
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = color; ctx.beginPath(); ctx.arc(0, 0, 12 + enemy.phase * 2, 0, TAU); ctx.fill();
+    } else if (kind === 'colossus') {
+      ctx.rotate(time * 0.08); ctx.lineWidth = 4;
+      for (let i = 0; i < 4; i++) {
+        ctx.save(); ctx.rotate(i * TAU / 4); ctx.strokeRect(-r * 0.26, -r * 1.12, r * 0.52, r * 0.42); ctx.restore();
+      }
+      for (const scale of [1, 0.7]) {
+        ctx.beginPath();
+        for (let i = 0; i < 6; i++) {
+          const angle = i * TAU / 6, px = Math.cos(angle) * r * scale, py = Math.sin(angle) * r * scale;
+          i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+        }
+        ctx.closePath(); ctx.fill(); ctx.stroke();
+      }
+      ctx.fillStyle = color; ctx.fillRect(-15 - enemy.phase * 2, -15 - enemy.phase * 2, 30 + enemy.phase * 4, 30 + enemy.phase * 4);
+      ctx.strokeRect(-r * 0.35, -r * 0.35, r * 0.7, r * 0.7);
+    } else {
+      ctx.rotate(time * 0.18);
+      for (let ring = 0; ring < 3; ring++) {
+        ctx.save(); ctx.rotate(ring * time * 0.22); ctx.setLineDash([24 - ring * 4, 14 + ring * 3]);
+        ctx.beginPath(); ctx.arc(0, 0, r + ring * 15, 0, TAU); ctx.stroke(); ctx.restore();
+      }
+      ctx.setLineDash([]);
+      ctx.beginPath(); for (let i = 0; i < 8; i++) { const a = i * TAU / 8; const px = Math.cos(a) * r * 0.8, py = Math.sin(a) * r * 0.8; i ? ctx.lineTo(px, py) : ctx.moveTo(px, py); } ctx.closePath(); ctx.fill(); ctx.stroke();
+      ctx.rotate(-time * 0.8); ctx.fillStyle = color; ctx.beginPath(); ctx.arc(0, 0, 15 + enemy.phase * 3, 0, TAU); ctx.fill();
+    }
+    if ((kind === 'warden' || kind === 'choir') && enemy.fireTimer < 0.45) {
+      const charge = 1 - enemy.fireTimer / 0.45;
+      ctx.globalAlpha = 0.25 + charge * 0.65; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(0, 0, r + 52 - charge * 35, 0, TAU); ctx.stroke();
+    }
+    ctx.setLineDash([]); ctx.globalAlpha = 1;
   }
 
   private drawShip(ctx: CanvasRenderingContext2D, x: number, y: number, angle: number, color: string, alpha: number, radius: number) {

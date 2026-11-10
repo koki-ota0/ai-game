@@ -1,11 +1,15 @@
+import { bossKindForEncounter } from './bosses';
+import type { BossKind } from './bosses';
+import { getStageXp } from './campaign';
+
 export const LEVEL_COUNT = 100;
 
 // Campaign starts with a slightly weaker bare frame. Persistent percentage
 // bonuses are applied afterwards; INFINITE never reads these modifiers.
 export const LEVEL_STARTING_MODIFIER = {
-  damage: 0.90,
-  fireRate: 0.95,
-  maxHp: 0.95,
+  damage: 0.88,
+  fireRate: 0.92,
+  maxHp: 0.90,
 } as const;
 
 export interface LevelDefinition {
@@ -22,8 +26,11 @@ export interface LevelDefinition {
   enemySpeed: number;
   spawnRate: number;
   eliteBonus: number;
+  hasBoss: boolean;
   bossTier: number;
+  bossKind: BossKind;
   bossHealth: number;
+  enemyXp: number;
   xpReward: number;
 }
 
@@ -40,13 +47,14 @@ function createLevel(id: number): LevelDefinition {
   const enemyHealth = Math.pow(1.02, id - 1);
   const bossTier = Math.min(4, 1 + Math.floor((id - 1) / 25));
   const sectorName = SECTOR_NAMES[sectorIndex]!;
+  const hasBoss = id % 5 === 0;
   return {
     id,
     sector: sectorIndex + 1,
     name: LEGACY_NAMES[id - 1] ?? DEPTH_NAMES[depth]!,
     sectorName,
     enName: `${SECTOR_EN_NAMES[sectorIndex]} // ${String(depth + 1).padStart(2, '0')}`,
-    briefing: `${sectorName}・深度${depth + 1}。時間異常と敵編成が変化。ワーデンを倒した後も、残敵を全滅させるまで終了しない。`,
+    briefing: `${sectorName}・深度${depth + 1}。${hasBoss ? '戦闘後にボスが出現。ボス撃破後も' : '規定時間で出現停止。'}残敵を全滅させるまで終了しない。`,
     combatDuration: 32 + sectorIndex * 2,
     // Director complexity grows separately from raw stats and remains bounded.
     enemyTier: Math.min(13, 1 + Math.floor((id - 1) / 8)),
@@ -57,9 +65,14 @@ function createLevel(id: number): LevelDefinition {
     enemySpeed: 1 + Math.min(0.22, (id - 1) * 0.0022),
     spawnRate: 1 + Math.min(0.15, (id - 1) * 0.0015),
     eliteBonus: Math.min(0.06, (id - 1) * 0.0006),
+    hasBoss,
     bossTier,
+    bossKind: id === LEVEL_COUNT ? 'warden' : bossKindForEncounter(id),
     bossHealth: enemyHealth * (0.82 + sectorIndex * 0.025),
-    xpReward: 120 + id * 10,
+    // Drops scale gently with stage difficulty and cap at 2.5x. This offsets
+    // the steeper run-level curve without creating exponential XP inflation.
+    enemyXp: 1 + Math.min(1.5, (id - 1) * 0.015),
+    xpReward: getStageXp(id, true),
   };
 }
 

@@ -29,26 +29,36 @@ let meta = null;
 if (gameMode === 'level' && metaProfile !== 'none') {
   meta = await page.evaluate(async ({ challengeLevel, metaProfile }) => {
     const campaign = await import('/src/game/campaign.ts');
-    const xp = metaProfile === 'max'
-      ? 259200
-      : Array.from({ length: Math.max(0, challengeLevel - 1) }, (_, index) => 120 + (index + 1) * 10).reduce((sum, value) => sum + value, 0);
-    const points = campaign.getBonusPoints(xp);
-    const bonuses = {};
+    localStorage.setItem(campaign.CAMPAIGN_XP_KEY, '0');
+    localStorage.setItem(campaign.CAMPAIGN_LOADOUT_KEY, '{}');
     if (metaProfile === 'max') {
-      for (const bonus of campaign.INITIAL_BONUSES) bonuses[bonus.id] = bonus.maxRank;
-    } else {
-      // A plausible non-perfect campaign build: 30% damage, 20% fire rate,
-      // 30% HP and 20% echo, rather than relying on a hidden maxed profile.
-      const order = ['damage', 'fireRate', 'vitality', 'echoDamage', 'vitality', 'damage', 'fireRate', 'vitality', 'echoDamage', 'damage'];
-      for (let index = 0; index < points; index++) {
-        const id = order[index % order.length];
-        bonuses[id] = (bonuses[id] ?? 0) + 1;
+      const bonuses = Object.fromEntries(campaign.INITIAL_BONUSES.map(bonus => [bonus.id, bonus.maxRank]));
+      localStorage.setItem(campaign.CAMPAIGN_LOADOUT_KEY, JSON.stringify(bonuses));
+      localStorage.setItem('echo-abyss-unlocked-level', String(challengeLevel));
+      return { profile: metaProfile, xp: 0, invested: campaign.getBonusInvestedXp(bonuses), ranks: campaign.countBonusRanks(bonuses), bonuses };
+    }
+
+    // Spend each previous first-clear reward on a plausible weighted build.
+    // Purchases use the real per-rank costs rather than a hidden point budget.
+    const order = ['damage', 'fireRate', 'vitality', 'echoDamage', 'vitality', 'damage', 'fireRate', 'vitality', 'echoDamage', 'damage'];
+    for (let stage = 1; stage < challengeLevel; stage++) {
+      const available = campaign.readCampaignXp() + campaign.getStageXp(stage, true);
+      localStorage.setItem(campaign.CAMPAIGN_XP_KEY, String(available));
+      let purchased = true;
+      while (purchased) {
+        purchased = false;
+        for (const id of order) {
+          const transaction = campaign.purchaseInitialBonus(id);
+          if (transaction.changed) purchased = true;
+        }
       }
     }
-    localStorage.setItem(campaign.CAMPAIGN_XP_KEY, String(xp));
-    localStorage.setItem(campaign.CAMPAIGN_LOADOUT_KEY, JSON.stringify(bonuses));
+    const bonuses = campaign.readInitialBonuses();
     localStorage.setItem('echo-abyss-unlocked-level', String(challengeLevel));
-    return { profile: metaProfile, xp, points, bonuses };
+    return {
+      profile: metaProfile, xp: campaign.readCampaignXp(), invested: campaign.getBonusInvestedXp(bonuses),
+      ranks: campaign.countBonusRanks(bonuses), bonuses,
+    };
   }, { challengeLevel, metaProfile });
   await page.reload({ waitUntil: 'networkidle' });
 }
@@ -179,7 +189,7 @@ while ((Date.now() - started) / 1000 < duration) {
       level: state.snapshot.level, hp: Math.round(state.hp), kills: state.kills,
       enemies: state.snapshot.enemies, echoes: state.snapshot.echoes,
       sync: Math.round(state.sync), boss: state.boss, bossHp: state.bossHp === null ? null : Math.round(state.bossHp),
-      cleanup: state.snapshot.bossDefeated ? state.snapshot.remainingEnemies : null,
+      cleanup: state.snapshot.cleanupStarted ? state.snapshot.remainingEnemies : null,
       rift: state.rift === null ? null : `${Math.floor(state.rift * 100)}%`, upgrades: state.stacks,
     }));
   }

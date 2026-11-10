@@ -90,7 +90,7 @@ export interface HudState {
   sync: number;
   overdrive: number;
   combo: number;
-  boss: { name: string; hp: number; maxHp: number; phase: number } | null;
+  boss: { name: string; hp: number; maxHp: number; phase: number; color: string } | null;
   core: CoreId;
   weapon: string;
   weaponDetail: string;
@@ -106,6 +106,7 @@ export interface HudState {
   challengeLevel: number;
   challengeName: string;
   challengeDuration: number;
+  challengeHasBoss: boolean;
   challengeCleanup: boolean;
   checkpointKind: 'sector' | 'build' | null;
   remainingEnemies: number;
@@ -129,7 +130,6 @@ export interface RunResult {
   newBest: boolean;
   xpEarned: number;
   totalXp: number;
-  bonusPoints: number;
   firstClear: boolean;
   reviveAvailable: boolean;
 }
